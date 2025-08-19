@@ -1,10 +1,8 @@
 import express from 'express';
-import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import morgan from 'morgan';
-import jwt from 'jsonwebtoken';
-import bcrypt from 'bcryptjs';
+import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
@@ -13,61 +11,64 @@ app.use(cors());
 app.use(express.json());
 app.use(morgan('dev'));
 
-// MongoDB connection
-const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/turf';
-await mongoose.connect(mongoUri);
+// Supabase clients
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Models
-const userSchema = new mongoose.Schema({
-  name: { type: String, required: true },
-  email: { type: String, unique: true, required: true },
-  phone: { type: String },
-  passwordHash: { type: String, required: true },
-  role: { type: String, enum: ['user', 'admin'], default: 'user' }
-}, { timestamps: true });
+if (!supabaseUrl || !supabaseAnonKey || !supabaseServiceKey) {
+  console.warn('Missing Supabase environment variables. Please set SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY');
+}
 
-const User = mongoose.model('User', userSchema);
+const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, { auth: { persistSession: false } });
+const supabaseAnon = createClient(supabaseUrl, supabaseAnonKey, { auth: { persistSession: false } });
 
-const turfSchema = new mongoose.Schema({
-  name: { type: String, required: true },
-  location: { type: String, required: true },
-  description: { type: String },
-  images: { type: [String], default: [] },
-  pricePerHour: { type: Number, required: true },
-  operatingHours: {
-    open: { type: String, required: true },
-    close: { type: String, required: true }
-  },
-  amenities: { type: [String], default: [] },
-  owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }
-}, { timestamps: true });
+function mapTurfRowToApi(row) {
+  if (!row) return null;
+  return {
+    _id: row.id,
+    id: row.id,
+    name: row.name,
+    location: row.location,
+    description: row.description || '',
+    images: Array.isArray(row.images) ? row.images : [],
+    pricePerHour: Number(row.price_per_hour || 0),
+    operatingHours: row.operating_hours || { open: '06:00', close: '22:00' },
+    amenities: Array.isArray(row.amenities) ? row.amenities : [],
+    owner: row.owner || null,
+  };
+}
 
-const Turf = mongoose.model('Turf', turfSchema);
-
-// Helpers
-const jwtSecret = process.env.JWT_SECRET || 'dev_secret_change_me';
-const jwtExpiresIn = '7d';
-
-function signToken(user) {
-  return jwt.sign({ sub: user._id.toString(), role: user.role, email: user.email, name: user.name }, jwtSecret, { expiresIn: jwtExpiresIn });
+async function getUserFromAuthHeader(req) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return { error: 'Missing token' };
+  const { data, error } = await supabaseAnon.auth.getUser(token);
+  if (error) return { error: 'Invalid token' };
+  const user = data.user;
+  const role = (user?.user_metadata?.role === 'admin') ? 'admin' : 'user';
+  return {
+    user: {
+      sub: user.id,
+      id: user.id,
+      email: user.email,
+      name: user.user_metadata?.name || '',
+      role,
+    },
+    token,
+  };
 }
 
 function auth(requiredRole) {
-  return (req, res, next) => {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-    if (!token) return res.status(401).json({ message: 'Missing token' });
-    try {
-      const payload = jwt.verify(token, jwtSecret);
-      req.user = payload;
-      if (requiredRole && payload.role !== requiredRole) {
-        return res.status(403).json({ message: 'Forbidden' });
-      }
-      next();
-    } catch (err) {
-      return res.status(401).json({ message: 'Invalid token' });
+  return async (req, res, next) => {
+    const result = await getUserFromAuthHeader(req);
+    if (result.error) return res.status(401).json({ message: result.error });
+    req.user = result.user;
+    if (requiredRole && req.user.role !== requiredRole) {
+      return res.status(403).json({ message: 'Forbidden' });
     }
-  }
+    next();
+  };
 }
 
 // Routes
@@ -77,13 +78,28 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { name, email, phone, password, role } = req.body;
     if (!name || !email || !password) return res.status(400).json({ message: 'Missing fields' });
-    const existing = await User.findOne({ email });
-    if (existing) return res.status(409).json({ message: 'Email already registered' });
-    const passwordHash = await bcrypt.hash(password, 10);
     const finalRole = role === 'admin' ? 'admin' : 'user';
-    const user = await User.create({ name, email, phone, passwordHash, role: finalRole });
-    const token = signToken(user);
-    res.status(201).json({ token, user: { id: user._id, name: user.name, email: user.email, role: user.role } });
+
+    // Create the user (confirmed) via Admin API
+    const { data: created, error: createError } = await supabaseAdmin.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { name, phone, role: finalRole },
+    });
+    if (createError) return res.status(400).json({ message: createError.message });
+
+    const newUser = created.user;
+
+    // Ensure a profile row exists
+    await supabaseAdmin.from('profiles').upsert({ id: newUser.id, name, phone, role: finalRole });
+
+    // Sign in to mint an access token for the client
+    const { data: signInData, error: signInError } = await supabaseAnon.auth.signInWithPassword({ email, password });
+    if (signInError || !signInData.session) return res.status(500).json({ message: signInError?.message || 'Failed to create session' });
+
+    const accessToken = signInData.session.access_token;
+    res.status(201).json({ token: accessToken, user: { id: newUser.id, name, email, role: finalRole } });
   } catch (e) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -92,12 +108,14 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email });
-    if (!user) return res.status(401).json({ message: 'Invalid credentials' });
-    const ok = await bcrypt.compare(password, user.passwordHash);
-    if (!ok) return res.status(401).json({ message: 'Invalid credentials' });
-    const token = signToken(user);
-    res.json({ token, user: { id: user._id, name: user.name, email: user.email, role: user.role } });
+    const { data, error } = await supabaseAnon.auth.signInWithPassword({ email, password });
+    if (error || !data.session) return res.status(401).json({ message: 'Invalid credentials' });
+
+    const accessToken = data.session.access_token;
+    const { data: userData } = await supabaseAnon.auth.getUser(accessToken);
+    const meta = userData?.user?.user_metadata || {};
+    const role = (meta.role === 'admin') ? 'admin' : 'user';
+    res.json({ token: accessToken, user: { id: userData?.user?.id, name: meta.name || '', email: userData?.user?.email, role } });
   } catch (e) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -123,43 +141,55 @@ app.post('/api/turfs', auth('admin'), async (req, res) => {
     if (!name || !location || !pricePerHour || !operatingHours?.open || !operatingHours?.close) {
       return res.status(400).json({ message: 'Missing required fields' });
     }
-    const turf = await Turf.create({
+    const payload = {
       name,
       location,
-      description,
+      description: description || '',
       images: Array.isArray(images) ? images : [],
-      pricePerHour,
-      operatingHours,
+      price_per_hour: Number(pricePerHour),
+      operating_hours: operatingHours,
       amenities: Array.isArray(amenities) ? amenities : [],
-      owner: req.user.sub
-    });
-    res.status(201).json({ turf });
+      owner: req.user.sub,
+    };
+    const { data, error } = await supabaseAdmin.from('turfs').insert(payload).select().single();
+    if (error) return res.status(400).json({ message: error.message });
+    res.status(201).json({ turf: mapTurfRowToApi(data) });
   } catch (e) {
     res.status(500).json({ message: 'Server error' });
   }
 });
 
 app.get('/api/turfs/mine', auth('admin'), async (req, res) => {
-  const turfs = await Turf.find({ owner: req.user.sub }).sort({ createdAt: -1 });
-  res.json({ turfs });
+  const { data, error } = await supabaseAdmin
+    .from('turfs')
+    .select('*')
+    .eq('owner', req.user.sub)
+    .order('created_at', { ascending: false });
+  if (error) return res.status(400).json({ message: error.message });
+  res.json({ turfs: (data || []).map(mapTurfRowToApi) });
 });
 
 app.get('/api/turfs/public', async (req, res) => {
-  const turfs = await Turf.find().sort({ createdAt: -1 });
-  res.json({ turfs });
+  const { data, error } = await supabaseAdmin
+    .from('turfs')
+    .select('*')
+    .order('created_at', { ascending: false });
+  if (error) return res.status(400).json({ message: error.message });
+  res.json({ turfs: (data || []).map(mapTurfRowToApi) });
 });
 
 app.get('/api/turfs/:id', async (req, res) => {
-  try {
-    const turf = await Turf.findById(req.params.id);
-    if (!turf) return res.status(404).json({ message: 'Not found' });
-    res.json({ turf });
-  } catch (e) {
-    res.status(400).json({ message: 'Invalid id' });
-  }
+  const { data, error } = await supabaseAdmin
+    .from('turfs')
+    .select('*')
+    .eq('id', req.params.id)
+    .single();
+  if (error && error.code === 'PGRST116') return res.status(404).json({ message: 'Not found' });
+  if (error) return res.status(400).json({ message: error.message });
+  res.json({ turf: mapTurfRowToApi(data) });
 });
 
-const port = process.env.PORT || 4000;
+const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`API listening on http://localhost:${port}`);
 });
