@@ -122,9 +122,110 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.get('/api/auth/me', auth(), async (req, res) => {
-  res.json({ user: { id: req.user.sub, name: req.user.name, email: req.user.email, role: req.user.role } });
+  try {
+    // Get user data from auth (for email)
+    const { data: userData, error: authError } = await supabaseAdmin.auth.admin.getUserById(req.user.sub);
+    if (authError) return res.status(400).json({ message: authError.message });
+
+    // Get profile data from profiles table
+    const { data: profileData, error: profileError } = await supabaseAdmin
+      .from('profiles')
+      .select('id, name, phone, location, company, role, profile_pic')
+      .eq('id', req.user.sub)
+      .single();
+    
+    if (profileError) return res.status(400).json({ message: profileError.message });
+
+    // Combine auth data with profile data
+    res.json({ 
+      user: { 
+        ...profileData, 
+        email: userData.user.email, // Get email from auth.users
+        avatar: profileData?.profile_pic 
+      } 
+    });
+  } catch (e) {
+    console.error('Server error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
 });
 
+app.put('/api/auth/me', auth(), async (req, res) => {
+  try {
+    const { name, email, phone, location, company, avatar } = req.body;
+    const userId = req.user.sub;
+
+    // Update profile fields in profiles table
+    const profileUpdateFields = { name, phone, location, company };
+    if (avatar) profileUpdateFields.profile_pic = avatar;
+
+    const { error: profileError } = await supabaseAdmin
+      .from('profiles')
+      .update(profileUpdateFields)
+      .eq('id', userId);
+
+    if (profileError) return res.status(400).json({ message: profileError.message });
+
+    // Update email in auth.users table if provided and different
+    if (email && email !== req.user.email) {
+      const { error: emailError } = await supabaseAdmin.auth.admin.updateUserById(userId, {
+        email: email
+      });
+      if (emailError) return res.status(400).json({ message: emailError.message });
+    }
+
+    res.json({ message: 'Profile updated successfully' });
+  } catch (e) {
+    console.error('Server error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Updated profile fetch route to get email from auth system
+app.get('/api/auth/profile', auth(), async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    // Get user data from auth (for email)
+    const { data: userData, error: authError } = await supabaseAdmin.auth.admin.getUserById(userId);
+    if (authError) {
+      console.error('Auth fetch error:', authError);
+      return res.status(400).json({ message: authError.message });
+    }
+    
+    // Get profile data from profiles table
+    const { data: profileData, error: profileError } = await supabaseAdmin
+      .from('profiles')
+      .select('*')
+      .eq('id', userId)
+      .single();
+
+    if (profileError) {
+      console.error('Profile fetch error:', profileError);
+      if (profileError.code === 'PGRST116') {
+        return res.status(404).json({ message: 'Profile not found' });
+      }
+      return res.status(400).json({ message: profileError.message });
+    }
+
+    res.json({ 
+      user: {
+        id: profileData.id,
+        name: profileData.name,
+        email: userData.user.email, // Get email from auth system
+        phone: profileData.phone,
+        company: profileData.company,
+        location: profileData.location,
+        profile_pic: profileData.profile_pic,
+        avatar: profileData.profile_pic, // Include both for compatibility
+        role: profileData.role
+      }
+    });
+  } catch (e) {
+    console.error('Server error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
 // Example protected routes
 app.get('/api/admin/overview', auth('admin'), (req, res) => {
   res.json({ message: 'admin data' });
