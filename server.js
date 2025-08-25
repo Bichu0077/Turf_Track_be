@@ -31,21 +31,6 @@ const pendingRegistrations = new Map();
 const OTP_EXPIRY_SECONDS = Number(process.env.OTP_EXPIRY_SECONDS || 600); // 10 minutes default
 const isProduction = process.env.NODE_ENV === 'production';
 
-function mapTurfRowToApi(row) {
-  if (!row) return null;
-  return {
-    _id: row.id,
-    id: row.id,
-    name: row.name,
-    location: row.location,
-    description: row.description || '',
-    images: Array.isArray(row.images) ? row.images : [],
-    pricePerHour: Number(row.price_per_hour || 0),
-    operatingHours: row.operating_hours || { open: '06:00', close: '22:00' },
-    amenities: Array.isArray(row.amenities) ? row.amenities : [],
-    owner: row.owner || null,
-  };
-}
 
 async function getUserFromAuthHeader(req) {
   const authHeader = req.headers.authorization || '';
@@ -393,59 +378,315 @@ app.get('/api/user/overview', auth('user'), (req, res) => {
   res.json({ message: 'user data' });
 });
 
-// Turf routes (admin-owned)
-app.post('/api/turfs', auth('admin'), async (req, res) => {
-  try {
-    const { name, location, description, images, pricePerHour, operatingHours, amenities } = req.body;
-    if (!name || !location || !pricePerHour || !operatingHours?.open || !operatingHours?.close) {
-      return res.status(400).json({ message: 'Missing required fields' });
-    }
-    const payload = {
-      name,
-      location,
-      description: description || '',
-      images: Array.isArray(images) ? images : [],
-      price_per_hour: Number(pricePerHour),
-      operating_hours: operatingHours,
-      amenities: Array.isArray(amenities) ? amenities : [],
-      owner: req.user.sub,
+function mapTurfRowToApi(row) {
+  let finalLocation;
+
+  // Case 1: The new coordinate object exists and is valid. Use it.
+  if (row.location_coordinates && typeof row.location_coordinates === 'object' && row.location_coordinates.address) {
+    finalLocation = {
+      address: row.location_coordinates.address,
+      latitude: row.location_coordinates.latitude,
+      longitude: row.location_coordinates.longitude,
     };
-    const { data, error } = await supabaseAdmin.from('turfs').insert(payload).select().single();
+  } 
+  // Case 2: Fallback to the old location string if coordinate object is missing.
+  else if (typeof row.location === 'string') {
+    finalLocation = {
+      address: row.location,
+      latitude: null, // Mark coordinates as unavailable
+      longitude: null,
+    };
+  } 
+  // Case 3: Default to an empty object if no location data is found at all.
+  else {
+     finalLocation = {
+      address: 'Location not available',
+      latitude: null,
+      longitude: null,
+    };
+  }
+
+  return {
+    _id: row.id,
+    name: row.name,
+    location: finalLocation, // This is now ALWAYS an object
+    description: row.description || '',
+    images: Array.isArray(row.images) ? row.images : [],
+    pricePerHour: row.price_per_hour,
+    operatingHours: row.operating_hours || { open: '06:00', close: '22:00' },
+    amenities: Array.isArray(row.amenities) ? row.amenities : [],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Radius of the Earth in kilometers
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = 
+    Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  const distance = R * c; // Distance in kilometers
+  return distance;
+}
+
+// Fixed public turfs endpoint
+app.get('/api/turfs/public', async (req, res) => {
+  try {
+    const { lat, lon, radius } = req.query;
+    
+    const { data, error } = await supabaseAdmin
+      .from('turfs')
+      .select('*')
+      .order('created_at', { ascending: false });
+      
     if (error) return res.status(400).json({ message: error.message });
-    res.status(201).json({ turf: mapTurfRowToApi(data) });
+
+    let turfs = (data || []).map(mapTurfRowToApi);
+
+    // If location filtering is requested, filter by radius
+    if (lat && lon && radius) {
+      const userLat = parseFloat(lat);
+      const userLon = parseFloat(lon);
+      const filterRadius = parseFloat(radius);
+
+      turfs = turfs.filter(turf => {
+        // Check if turf has coordinate data
+        const turfLocation = turf.location;
+        if (typeof turfLocation === 'object' && 
+            turfLocation.latitude && 
+            turfLocation.longitude) {
+          const distance = calculateDistance(
+            userLat, 
+            userLon, 
+            turfLocation.latitude, 
+            turfLocation.longitude
+          );
+          return distance <= filterRadius;
+        }
+        return true; // Include turfs without coordinates (backward compatibility)
+      });
+    }
+
+    res.json({ turfs });
   } catch (e) {
+    console.error('Error fetching public turfs:', e);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
+// Fixed create turf endpoint with better validation
+app.post('/api/turfs', auth('admin'), async (req, res) => {
+  try {
+    const { name, location, description, images, pricePerHour, operatingHours, amenities } = req.body;
+    
+    // Validate required fields
+    if (!name || !location || !pricePerHour) {
+      return res.status(400).json({ message: 'Name, location, and price per hour are required' });
+    }
+
+    if (!operatingHours || !operatingHours.open || !operatingHours.close) {
+      return res.status(400).json({ message: 'Operating hours (open and close) are required' });
+    }
+
+    // Prepare location data for both old and new format
+    let locationString = '';
+    let locationCoordinates = null;
+
+    if (typeof location === 'string') {
+      locationString = location;
+    } else if (location && typeof location === 'object' && location.address) {
+      locationString = location.address;
+      locationCoordinates = {
+        address: location.address,
+        latitude: parseFloat(location.latitude),
+        longitude: parseFloat(location.longitude)
+      };
+    } else {
+      return res.status(400).json({ message: 'Invalid location format' });
+    }
+
+    const payload = {
+      name: name.trim(),
+      location: locationString,
+      location_coordinates: locationCoordinates,
+      description: description || '',
+      images: Array.isArray(images) ? images.filter(img => img.trim()) : [],
+      price_per_hour: Number(pricePerHour),
+      operating_hours: operatingHours,
+      amenities: Array.isArray(amenities) ? amenities.filter(a => a.trim()) : [],
+      owner: req.user.sub,
+    };
+
+    const { data, error } = await supabaseAdmin.from('turfs').insert(payload).select().single();
+    if (error) {
+      console.error('Database error:', error);
+      return res.status(400).json({ message: error.message });
+    }
+    
+    res.status(201).json({ turf: mapTurfRowToApi(data) });
+  } catch (e) {
+    console.error('Error creating turf:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Fixed update turf endpoint
+app.put('/api/turfs/:id', auth('admin'), async (req, res) => {
+  try {
+    const { name, location, description, images, pricePerHour, operatingHours, amenities } = req.body;
+    
+    // Validate required fields
+    if (!name || !location || !pricePerHour) {
+      return res.status(400).json({ message: 'Name, location, and price per hour are required' });
+    }
+
+    if (!operatingHours || !operatingHours.open || !operatingHours.close) {
+      return res.status(400).json({ message: 'Operating hours (open and close) are required' });
+    }
+
+    // Check ownership first
+    const { data: existingTurf, error: fetchError } = await supabaseAdmin
+      .from('turfs')
+      .select('owner')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchError && fetchError.code === 'PGRST116') {
+      return res.status(404).json({ message: 'Turf not found' });
+    }
+    if (fetchError) return res.status(400).json({ message: fetchError.message });
+
+    if (existingTurf.owner !== req.user.sub) {
+      return res.status(403).json({ message: 'Not authorized to update this turf' });
+    }
+
+    // Prepare location data for both old and new format
+    let locationString = '';
+    let locationCoordinates = null;
+
+    if (typeof location === 'string') {
+      locationString = location;
+    } else if (location && typeof location === 'object' && location.address) {
+      locationString = location.address;
+      locationCoordinates = {
+        address: location.address,
+        latitude: parseFloat(location.latitude),
+        longitude: parseFloat(location.longitude)
+      };
+    }
+
+    const payload = {
+      name: name.trim(),
+      location: locationString,
+      location_coordinates: locationCoordinates,
+      description: description || '',
+      images: Array.isArray(images) ? images.filter(img => img.trim()) : [],
+      price_per_hour: Number(pricePerHour),
+      operating_hours: operatingHours,
+      amenities: Array.isArray(amenities) ? amenities.filter(a => a.trim()) : []
+    };
+
+    // Update the turf
+    const { data, error } = await supabaseAdmin
+      .from('turfs')
+      .update(payload)
+      .eq('id', req.params.id)
+      .eq('owner', req.user.sub)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Update error:', error);
+      return res.status(400).json({ message: error.message });
+    }
+    
+    res.json({ turf: mapTurfRowToApi(data) });
+  } catch (e) {
+    console.error('Error updating turf:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Fixed get my turfs endpoint
 app.get('/api/turfs/mine', auth('admin'), async (req, res) => {
-  const { data, error } = await supabaseAdmin
-    .from('turfs')
-    .select('*')
-    .eq('owner', req.user.sub)
-    .order('created_at', { ascending: false });
-  if (error) return res.status(400).json({ message: error.message });
-  res.json({ turfs: (data || []).map(mapTurfRowToApi) });
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('turfs')
+      .select('*')
+      .eq('owner', req.user.sub)
+      .order('created_at', { ascending: false });
+    
+    if (error) {
+      console.error('Fetch mine error:', error);
+      return res.status(400).json({ message: error.message });
+    }
+    
+    res.json({ turfs: (data || []).map(mapTurfRowToApi) });
+  } catch (e) {
+    console.error('Error fetching user turfs:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
 });
 
-app.get('/api/turfs/public', async (req, res) => {
-  const { data, error } = await supabaseAdmin
-    .from('turfs')
-    .select('*')
-    .order('created_at', { ascending: false });
-  if (error) return res.status(400).json({ message: error.message });
-  res.json({ turfs: (data || []).map(mapTurfRowToApi) });
-});
-
+// Fixed get single turf endpoint
 app.get('/api/turfs/:id', async (req, res) => {
-  const { data, error } = await supabaseAdmin
-    .from('turfs')
-    .select('*')
-    .eq('id', req.params.id)
-    .single();
-  if (error && error.code === 'PGRST116') return res.status(404).json({ message: 'Not found' });
-  if (error) return res.status(400).json({ message: error.message });
-  res.json({ turf: mapTurfRowToApi(data) });
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('turfs')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+    
+    if (error && error.code === 'PGRST116') {
+      return res.status(404).json({ message: 'Turf not found' });
+    }
+    if (error) {
+      console.error('Fetch turf error:', error);
+      return res.status(400).json({ message: error.message });
+    }
+    
+    res.json({ turf: mapTurfRowToApi(data) });
+  } catch (e) {
+    console.error('Error fetching turf:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Delete turf endpoint (unchanged, working correctly)
+app.delete('/api/turfs/:id', auth('admin'), async (req, res) => {
+  try {
+    // Check ownership
+    const { data: existingTurf, error: fetchError } = await supabaseAdmin
+      .from('turfs')
+      .select('owner, name')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchError && fetchError.code === 'PGRST116') {
+      return res.status(404).json({ message: 'Turf not found' });
+    }
+    if (fetchError) return res.status(400).json({ message: fetchError.message });
+
+    if (existingTurf.owner !== req.user.sub) {
+      return res.status(403).json({ message: 'Not authorized to delete this turf' });
+    }
+
+    // Delete the turf
+    const { error } = await supabaseAdmin
+      .from('turfs')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('owner', req.user.sub);
+
+    if (error) return res.status(400).json({ message: error.message });
+    res.json({ message: 'Turf deleted successfully' });
+  } catch (e) {
+    console.error('Error deleting turf:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
 });
 
 const port = process.env.PORT || 3000;
