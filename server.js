@@ -35,9 +35,17 @@ const isProduction = process.env.NODE_ENV === 'production';
 async function getUserFromAuthHeader(req) {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  if (!token) return { error: 'Missing token' };
+  console.log('[getUserFromAuthHeader] Authorization header:', authHeader);
+  console.log('[getUserFromAuthHeader] Extracted token:', token);
+  if (!token) {
+    console.error('[getUserFromAuthHeader] Missing token');
+    return { error: 'Missing token' };
+  }
   const { data, error } = await supabaseAnon.auth.getUser(token);
-  if (error) return { error: 'Invalid token' };
+  if (error) {
+    console.error('[getUserFromAuthHeader] supabaseAnon.auth.getUser error:', error);
+    return { error: 'Invalid token' };
+  }
   const user = data.user;
   const role = (user?.user_metadata?.role === 'admin') ? 'admin' : 'user';
   return {
@@ -280,13 +288,13 @@ app.get('/api/auth/me', auth(), async (req, res) => {
     if (profileError) return res.status(400).json({ message: profileError.message });
 
     // Combine auth data with profile data
-    res.json({ 
-      user: { 
-        ...profileData, 
-        email: userData.user.email, // Get email from auth.users
-        avatar: profileData?.profile_pic 
-      } 
-    });
+    const userObj = {
+      ...profileData,
+      email: userData.user.email, // Get email from auth.users
+      avatar: profileData?.profile_pic
+    };
+    console.log("[GET /api/auth/me] user response:", userObj);
+    res.json({ user: userObj });
   } catch (e) {
     console.error('Server error:', e);
     res.status(500).json({ message: 'Server error' });
@@ -295,6 +303,10 @@ app.get('/api/auth/me', auth(), async (req, res) => {
 
 app.put('/api/auth/me', auth(), async (req, res) => {
   try {
+    // Debug logs for troubleshooting 401 errors
+    console.log('[PUT /api/auth/me] Authorization header:', req.headers.authorization);
+    console.log('[PUT /api/auth/me] req.user:', req.user);
+
     const { name, email, phone, location, company, avatar } = req.body;
     const userId = req.user.sub;
 
