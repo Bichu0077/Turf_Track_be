@@ -431,6 +431,32 @@ function mapTurfRowToApi(row) {
     updatedAt: row.updated_at
   };
 }
+
+// Helper: map DB booking row to FE API shape
+function mapBookingRowToApi(row, turfNameMap = {}) {
+  return {
+    id: row.id,
+    turfId: row.turf_id,
+    turfName: row.turf_name || turfNameMap[row.turf_id] || row.turf_id,
+    userName: row.user_name,
+    userEmail: row.user_email,
+    userPhone: row.user_phone,
+    bookingDate: row.booking_date,
+    startTime: row.start_time,
+    endTime: row.end_time,
+    totalAmount: Number(row.total_amount || 0),
+    paymentStatus: row.payment_status || 'completed',
+    bookingStatus: row.booking_status || 'confirmed',
+    createdAt: row.created_at,
+  };
+}
+
+function timeToMinutes(t) {
+  if (!t) return 0;
+  const [h, m] = t.split(':').map(Number);
+  return h * 60 + (m || 0);
+}
+
 function calculateDistance(lat1, lon1, lat2, lon2) {
   const R = 6371; // Radius of the Earth in kilometers
   const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -663,6 +689,173 @@ app.get('/api/turfs/:id', async (req, res) => {
     res.json({ turf: mapTurfRowToApi(data) });
   } catch (e) {
     console.error('Error fetching turf:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Availability for a turf on a specific date: returns booked hour starts ["14:00", ...]
+app.get('/api/turfs/:id/availability', async (req, res) => {
+  try {
+    const turfId = req.params.id;
+    const date = req.query.date;
+    if (!date) return res.status(400).json({ message: 'date (YYYY-MM-DD) is required' });
+    const { data, error } = await supabaseAdmin
+      .from('bookings')
+      .select('start_time, end_time, booking_status')
+      .eq('turf_id', turfId)
+      .eq('booking_date', date)
+      .neq('booking_status', 'cancelled');
+    if (error) return res.status(400).json({ message: error.message });
+    const bookedTimes = [];
+    (data || []).forEach(b => {
+      const s = timeToMinutes(b.start_time);
+      const e = timeToMinutes(b.end_time);
+      for (let m = s; m < e; m += 60) {
+        const hh = String(Math.floor(m / 60)).padStart(2, '0');
+        bookedTimes.push(`${hh}:00`);
+      }
+    });
+    res.json({ bookedTimes: Array.from(new Set(bookedTimes)) });
+  } catch (e) {
+    console.error('Error fetching availability:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Create a booking
+app.post('/api/bookings', auth(), async (req, res) => {
+  try {
+    const {
+      turfId,
+      date,
+      startTime,
+      endTime,
+      totalAmount,
+      userName,
+      userEmail,
+      userPhone,
+    } = req.body || {};
+
+    if (!turfId || !date || !startTime || !endTime || !userName || !userEmail) {
+      return res.status(400).json({ message: 'Missing required fields' });
+    }
+
+    // Basic sanity: end after start and hourly increments
+    const sMin = timeToMinutes(startTime);
+    const eMin = timeToMinutes(endTime);
+    if (!(eMin > sMin) || ((eMin - sMin) % 60) !== 0) {
+      return res.status(400).json({ message: 'Invalid time range' });
+    }
+
+    // Ensure turf exists
+    const { data: turfRow, error: turfErr } = await supabaseAdmin
+      .from('turfs')
+      .select('id, name, operating_hours, price_per_hour')
+      .eq('id', turfId)
+      .single();
+    if (turfErr) return res.status(400).json({ message: turfErr.message });
+    if (!turfRow) return res.status(404).json({ message: 'Turf not found' });
+
+    // Availability check: no overlapping non-cancelled bookings for same date
+    const { data: existing, error: conflictErr } = await supabaseAdmin
+      .from('bookings')
+      .select('start_time, end_time')
+      .eq('turf_id', turfId)
+      .eq('booking_date', date)
+      .neq('booking_status', 'cancelled');
+    if (conflictErr) return res.status(400).json({ message: conflictErr.message });
+    const conflict = (existing || []).some(b => {
+      const bs = timeToMinutes(b.start_time);
+      const be = timeToMinutes(b.end_time);
+      // Overlap if start < be and end > bs
+      return sMin < be && eMin > bs;
+    });
+    if (conflict) return res.status(409).json({ message: 'Selected time overlaps an existing booking' });
+
+    // Default total if not provided
+    const durationHours = (eMin - sMin) / 60;
+    const computedTotal = Number(totalAmount ?? (Number(turfRow.price_per_hour) * durationHours));
+
+    const payload = {
+      turf_id: turfId,
+      turf_name: turfRow.name, // Fix: include turf_name
+      user_id: req.user.sub,
+      user_name: userName,
+      user_email: userEmail,
+      user_phone: userPhone || null,
+      booking_date: date,
+      start_time: startTime,
+      end_time: endTime,
+      total_amount: computedTotal,
+      payment_status: 'completed',
+      booking_status: 'confirmed',
+    };
+
+    const { data: created, error: createErr } = await supabaseAdmin
+      .from('bookings')
+      .insert(payload)
+      .select('*')
+      .single();
+    if (createErr) return res.status(400).json({ message: createErr.message });
+
+    const api = mapBookingRowToApi(created, { [turfId]: turfRow.name });
+    res.status(201).json({ booking: api });
+  } catch (e) {
+    console.error('Error creating booking:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Current user's bookings
+app.get('/api/bookings/mine', auth(), async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('bookings')
+      .select('*')
+      .eq('user_id', req.user.sub)
+      .order('created_at', { ascending: false });
+    if (error) return res.status(400).json({ message: error.message });
+
+    // Fetch turf names for mapping
+    const turfIds = Array.from(new Set((data || []).map(b => b.turf_id)));
+    let turfNameMap = {};
+    if (turfIds.length) {
+      const { data: turfs, error: turfErr } = await supabaseAdmin
+        .from('turfs')
+        .select('id, name')
+        .in('id', turfIds);
+      if (!turfErr && turfs) {
+        turfNameMap = Object.fromEntries(turfs.map(t => [t.id, t.name]));
+      }
+    }
+    res.json({ bookings: (data || []).map(r => mapBookingRowToApi(r, turfNameMap)) });
+  } catch (e) {
+    console.error('Error fetching my bookings:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Admin: list all bookings
+app.get('/api/bookings', auth('admin'), async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('bookings')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) return res.status(400).json({ message: error.message });
+
+    const turfIds = Array.from(new Set((data || []).map(b => b.turf_id)));
+    let turfNameMap = {};
+    if (turfIds.length) {
+      const { data: turfs } = await supabaseAdmin
+        .from('turfs')
+        .select('id, name')
+        .in('id', turfIds);
+      if (turfs) turfNameMap = Object.fromEntries(turfs.map(t => [t.id, t.name]));
+    }
+    res.json({ bookings: (data || []).map(r => mapBookingRowToApi(r, turfNameMap)) });
+  } catch (e) {
+    console.error('Error fetching all bookings:', e);
     res.status(500).json({ message: 'Server error' });
   }
 });
