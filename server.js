@@ -129,12 +129,55 @@ function auth(requiredRole) {
 // Routes
 app.get('/', (req, res) => res.json({ ok: true }));
 
+// Internal helper to check if email exists using GoTrue Admin REST (reliable by-email)
+async function emailExists(rawEmail) {
+  const email = String(rawEmail || '').trim().toLowerCase();
+  if (!email) return false;
+  try {
+    const url = `${supabaseUrl}/auth/v1/admin/users?email=${encodeURIComponent(email)}`;
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'apikey': supabaseServiceKey,
+        'Authorization': `Bearer ${supabaseServiceKey}`,
+      },
+    });
+    if (!resp.ok) {
+      console.error('[emailExists] Admin REST error status:', resp.status);
+      return false;
+    }
+    const json = await resp.json().catch(() => ({ users: [] }));
+    const users = Array.isArray(json?.users) ? json.users : (Array.isArray(json) ? json : []);
+    return users.some(u => (u.email || '').toLowerCase() === email);
+  } catch (err) {
+    console.error('[emailExists] error:', err);
+    return false;
+  }
+}
+
+// Check if an email is already registered
+app.get('/api/auth/email-available', async (req, res) => {
+  try {
+    const rawEmail = (req.query.email || '').toString();
+    if (!rawEmail) return res.status(400).json({ message: 'Missing email' });
+    const exists = await emailExists(rawEmail);
+    return res.json({ available: !exists });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // Start registration: create pending registration and send OTP
 app.post('/api/auth/register/start', async (req, res) => {
   try {
     const { name, email, phone, password, role } = req.body || {};
     if (!name || !email || !password) return res.status(400).json({ message: 'Missing fields' });
     const finalRole = role === 'admin' ? 'admin' : 'user';
+
+    // Prevent starting registration if email already exists (reliable by-email)
+    const exists = await emailExists(email);
+    if (exists) return res.status(409).json({ message: 'Account is already registered' });
 
     // Create transaction and OTP
     const transactionId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
