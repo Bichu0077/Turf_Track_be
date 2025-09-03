@@ -1,3 +1,4 @@
+
 import express from 'express';
 import dotenv from 'dotenv';
 import cors from 'cors';
@@ -6,11 +7,13 @@ import { createClient } from '@supabase/supabase-js';
 import nodemailer from "nodemailer";
 import crypto from 'crypto';
 
+// ...existing code...
+
 dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // Increase limit for image uploads
 app.use(morgan('dev'));
 
 // Supabase clients
@@ -31,6 +34,24 @@ const pendingRegistrations = new Map();
 const OTP_EXPIRY_SECONDS = Number(process.env.OTP_EXPIRY_SECONDS || 600); // 10 minutes default
 const isProduction = process.env.NODE_ENV === 'production';
 
+
+// Simple in-memory activity store per user (consider persisting in DB for production)
+const userActivities = new Map();
+function appendUserActivity(userId, activity) {
+  const maxItems = 100;
+  const list = userActivities.get(userId) || [];
+  const entry = {
+    id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    type: activity.type,
+    message: activity.message,
+    details: activity.details || {},
+    createdAt: new Date().toISOString()
+  };
+  list.unshift(entry);
+  if (list.length > maxItems) list.length = maxItems;
+  userActivities.set(userId, list);
+  return entry;
+}
 
 async function getUserFromAuthHeader(req) {
   const authHeader = req.headers.authorization || '';
@@ -63,6 +84,27 @@ async function getUserFromAuthHeader(req) {
 function generateOtpCode() {
   const num = Math.floor(Math.random() * 1000000);
   return String(num).padStart(6, '0');
+}
+
+// Helper function to format dates consistently
+function formatDate(dateString) {
+  if (!dateString) {
+    console.log('[formatDate] No date string provided');
+    return null;
+  }
+  try {
+    const date = new Date(dateString);
+    if (isNaN(date.getTime())) {
+      console.log('[formatDate] Invalid date:', dateString);
+      return null;
+    }
+    const formatted = date.toISOString();
+    console.log('[formatDate] Formatted date:', dateString, '->', formatted);
+    return formatted;
+  } catch (error) {
+    console.error('[formatDate] Error formatting date:', error, 'Input:', dateString);
+    return null;
+  }
 }
 
 async function getMailer() {
@@ -255,7 +297,28 @@ app.post('/api/auth/register/verify', async (req, res) => {
     pendingRegistrations.delete(entryKey);
 
     const accessToken = signInData.session.access_token;
-    res.json({ token: accessToken, user: { id: newUser.id, name: entry.name, email: entry.email, role: entry.role } });
+    const userResponse = { 
+      token: accessToken, 
+      user: { 
+        id: newUser.id, 
+        name: entry.name, 
+        email: entry.email, 
+        role: entry.role,
+        createdAt: formatDate(newUser.created_at),
+        memberSince: formatDate(newUser.created_at),
+        lastLoginAt: new Date().toISOString()
+      } 
+    };
+    
+    console.log("[POST /api/auth/register/verify] user response:", userResponse);
+    console.log("[POST /api/auth/register/verify] Raw new user data:", {
+      id: newUser.id,
+      email: newUser.email,
+      created_at: newUser.created_at,
+      formatted_created_at: formatDate(newUser.created_at)
+    });
+    
+    res.json(userResponse);
   } catch (e) {
     console.error(e);
     res.status(500).json({ message: 'Server error' });
@@ -309,7 +372,28 @@ app.post('/api/auth/login', async (req, res) => {
     const { data: userData } = await supabaseAnon.auth.getUser(accessToken);
     const meta = userData?.user?.user_metadata || {};
     const role = (meta.role === 'admin') ? 'admin' : 'user';
-    res.json({ token: accessToken, user: { id: userData?.user?.id, name: meta.name || '', email: userData?.user?.email, role } });
+    const userResponse = { 
+      token: accessToken, 
+      user: { 
+        id: userData?.user?.id, 
+        name: meta.name || '', 
+        email: userData?.user?.email, 
+        role,
+        createdAt: formatDate(userData?.user?.created_at),
+        memberSince: formatDate(userData?.user?.created_at),
+        lastLoginAt: new Date().toISOString()
+      } 
+    };
+    
+    console.log("[POST /api/auth/login] user response:", userResponse);
+    console.log("[POST /api/auth/login] Raw user data:", {
+      id: userData?.user?.id,
+      email: userData?.user?.email,
+      created_at: userData?.user?.created_at,
+      formatted_created_at: formatDate(userData?.user?.created_at)
+    });
+    
+    res.json(userResponse);
   } catch (e) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -320,6 +404,113 @@ app.get('/api/auth/me', auth(), async (req, res) => {
     // Get user data from auth (for email)
     const { data: userData, error: authError } = await supabaseAdmin.auth.admin.getUserById(req.user.sub);
     if (authError) return res.status(400).json({ message: authError.message });
+    
+    // Debug: Log the complete Supabase auth response
+    console.log("[GET /api/auth/me] Complete Supabase auth response:", JSON.stringify(userData, null, 2));
+    console.log("[GET /api/auth/me] Available user fields:", Object.keys(userData.user || {}));
+    console.log("[GET /api/auth/me] All user field values:", Object.fromEntries(
+      Object.entries(userData.user || {}).map(([key, value]) => [key, typeof value === 'string' ? value : typeof value])
+    ));
+    console.log("[GET /api/auth/me] All user field values (detailed):", Object.fromEntries(
+      Object.entries(userData.user || {}).map(([key, value]) => [key, {
+        type: typeof value,
+        value: value,
+        isDate: value instanceof Date,
+        isString: typeof value === 'string',
+        length: typeof value === 'string' ? value.length : undefined
+      }])
+    ));
+    console.log("[GET /api/auth/me] Searching for date fields:");
+    Object.entries(userData.user || {}).forEach(([key, value]) => {
+      if (typeof value === 'string' && (key.toLowerCase().includes('created') || key.toLowerCase().includes('date'))) {
+        console.log(`  - Found potential date field: ${key} = ${value}`);
+      }
+    });
+    console.log("[GET /api/auth/me] All field names (case-insensitive search):");
+    Object.keys(userData.user || {}).forEach(key => {
+      console.log(`  - ${key}`);
+    });
+    console.log("[GET /api/auth/me] Checking for common date field variations:");
+    const commonDateFields = ['created_at', 'createdAt', 'created', 'created_at_iso', 'created_at_utc', 'created_at_local'];
+    commonDateFields.forEach(field => {
+      console.log(`  - ${field}: ${userData.user?.[field]}`);
+    });
+    console.log("[GET /api/auth/me] Checking for any field containing 'created':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('created')) {
+        console.log(`  - Found field with 'created': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/me] Checking for any field containing 'date':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('date')) {
+        console.log(`  - Found field with 'date': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/me] Checking for any field containing 'time':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('time')) {
+        console.log(`  - Found field with 'time': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/me] Checking for any field containing 'stamp':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('stamp')) {
+        console.log(`  - Found field with 'stamp': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/me] Checking for any field containing 'when':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('when')) {
+        console.log(`  - Found field with 'when': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/me] Checking for any field containing 'at':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('at')) {
+        console.log(`  - Found field with 'at': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/me] Checking for any field containing 'on':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('on')) {
+        console.log(`  - Found field with 'on': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/me] Checking for any field containing 'since':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('since')) {
+        console.log(`  - Found field with 'since': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/me] Checking for any field containing 'from':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('from')) {
+        console.log(`  - Found field with 'from': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/me] Checking for any field containing 'to':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('to')) {
+        console.log(`  - Found field with 'to': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/me] Checking for any field containing 'in':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('in')) {
+        console.log(`  - Found field with 'in': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/me] User created_at field:", userData.user?.created_at);
+    console.log("[GET /api/auth/me] User created_at type:", typeof userData.user?.created_at);
+    console.log("[GET /api/auth/me] User createdAt field:", userData.user?.createdAt);
+    console.log("[GET /api/auth/me] User created field:", userData.user?.created);
+    console.log("[GET /api/auth/me] User created_at_iso field:", userData.user?.created_at_iso);
+    console.log("[GET /api/auth/me] User metadata:", userData.user?.user_metadata);
+    console.log("[GET /api/auth/me] User app_metadata:", userData.user?.app_metadata);
+    console.log("[GET /api/auth/me] Raw created_at value:", userData.user?.created_at);
+    console.log("[GET /api/auth/me] Raw created_at value type:", typeof userData.user?.created_at);
+    console.log("[GET /api/auth/me] Raw created_at value length:", userData.user?.created_at?.length);
 
     // Get profile data from profiles table
     const { data: profileData, error: profileError } = await supabaseAdmin
@@ -334,12 +525,42 @@ app.get('/api/auth/me', auth(), async (req, res) => {
     const userObj = {
       ...profileData,
       email: userData.user.email, // Get email from auth.users
-      avatar: profileData?.profile_pic
+      avatar: profileData?.profile_pic,
+      createdAt: formatDate(userData.user.created_at), // Add account creation date from auth.users
+      memberSince: formatDate(userData.user.created_at), // Add member since date for frontend compatibility
+      lastLoginAt: new Date().toISOString() // Add current login time
     };
+    
+    // Debug: Log the date processing
+    console.log("[GET /api/auth/me] Date processing debug:");
+    console.log("  - Raw created_at:", userData.user.created_at);
+    console.log("  - Formatted createdAt:", userObj.createdAt);
+    console.log("  - Formatted memberSince:", userObj.memberSince);
+    console.log("  - lastLoginAt:", userObj.lastLoginAt);
     console.log("[GET /api/auth/me] user response:", userObj);
+    console.log("[GET /api/auth/me] Raw auth user data:", {
+      id: userData.user.id,
+      email: userData.user.email,
+      created_at: userData.user.created_at,
+      formatted_created_at: formatDate(userData.user.created_at)
+    });
+    console.log("[GET /api/auth/me] Complete user object being sent:", JSON.stringify(userObj, null, 2));
     res.json({ user: userObj });
   } catch (e) {
     console.error('Server error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Recent activity endpoint
+app.get('/api/auth/activity', auth(), async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const limit = Number(req.query.limit || 20);
+    const list = (userActivities.get(userId) || []).slice(0, Math.max(1, Math.min(100, limit)));
+    res.json({ activities: list });
+  } catch (e) {
+    console.error('Server error fetching activity:', e);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -353,16 +574,62 @@ app.put('/api/auth/me', auth(), async (req, res) => {
     const { name, email, phone, location, company, avatar } = req.body;
     const userId = req.user.sub;
 
-    // Update profile fields in profiles table
-    const profileUpdateFields = { name, phone, location, company };
-    if (avatar) profileUpdateFields.profile_pic = avatar;
+    // Validate avatar size if provided
+    if (avatar && typeof avatar === 'string') {
+      // Check if it's a data URL
+      if (avatar.startsWith('data:image/')) {
+        const base64Length = avatar.length - (avatar.indexOf(',') + 1);
+        const sizeInBytes = Math.ceil((base64Length * 3) / 4);
+        const sizeInMB = sizeInBytes / (1024 * 1024);
+        
+        if (sizeInMB > 1) { // 1MB limit for compressed images
+          return res.status(400).json({ 
+            message: `Image size (${sizeInMB.toFixed(1)}MB) is too large. Please compress the image or choose a smaller one.` 
+          });
+        }
+      }
+    }
 
-    const { error: profileError } = await supabaseAdmin
-      .from('profiles')
-      .update(profileUpdateFields)
-      .eq('id', userId);
+    // Update profile fields in profiles table if any profile data is provided
+    if (name !== undefined || phone !== undefined || location !== undefined || company !== undefined || avatar !== undefined) {
+      const profileUpdateFields = {};
+      // Fetch current profile to compute diffs for activity log
+      const { data: currentProfile } = await supabaseAdmin
+        .from('profiles')
+        .select('name, phone, location, company, profile_pic')
+        .eq('id', userId)
+        .single();
+      if (name !== undefined) profileUpdateFields.name = name;
+      if (phone !== undefined) profileUpdateFields.phone = phone;
+      if (location !== undefined) profileUpdateFields.location = location;
+      if (company !== undefined) profileUpdateFields.company = company;
+      if (avatar !== undefined) profileUpdateFields.profile_pic = avatar;
 
-    if (profileError) return res.status(400).json({ message: profileError.message });
+      const { error: profileError } = await supabaseAdmin
+        .from('profiles')
+        .update(profileUpdateFields)
+        .eq('id', userId);
+
+      if (profileError) return res.status(400).json({ message: profileError.message });
+
+      // Compute changed fields
+      const changed = {};
+      if (currentProfile) {
+        if (name !== undefined && currentProfile.name !== name) changed.name = { from: currentProfile.name, to: name };
+        if (phone !== undefined && currentProfile.phone !== phone) changed.phone = { from: currentProfile.phone, to: phone };
+        if (location !== undefined && currentProfile.location !== location) changed.location = { from: currentProfile.location, to: location };
+        if (company !== undefined && currentProfile.company !== company) changed.company = { from: currentProfile.company, to: company };
+        if (avatar !== undefined && currentProfile.profile_pic !== avatar) changed.avatar = { from: currentProfile.profile_pic, to: avatar };
+      }
+      // Append activity if there are changes
+      if (Object.keys(changed).length > 0) {
+        appendUserActivity(userId, {
+          type: 'profile_update',
+          message: 'Updated profile information',
+          details: { changed }
+        });
+      }
+    }
 
     // Update email in auth.users table if provided and different
     if (email && email !== req.user.email) {
@@ -370,15 +637,103 @@ app.put('/api/auth/me', auth(), async (req, res) => {
         email: email
       });
       if (emailError) return res.status(400).json({ message: emailError.message });
+      appendUserActivity(userId, {
+        type: 'email_update',
+        message: 'Updated account email',
+        details: { from: req.user.email, to: email }
+      });
     }
 
-    res.json({ message: 'Profile updated successfully' });
+    // Fetch and return updated profile data
+    const { data: updatedProfile, error: fetchError } = await supabaseAdmin
+      .from('profiles')
+      .select('id, name, phone, location, company, role, profile_pic')
+      .eq('id', userId)
+      .single();
+    
+    if (fetchError) return res.status(400).json({ message: fetchError.message });
+    
+    res.json({ 
+      message: 'Profile updated successfully',
+      profile: {
+        ...updatedProfile,
+        avatar: updatedProfile.profile_pic
+      }
+    });
   } catch (e) {
     console.error('Server error:', e);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
+// Password change endpoint
+app.post('/api/auth/change-password', auth(), async (req, res) => {
+  try {
+    console.log('[POST /api/auth/change-password] User ID:', req.user.sub);
+
+    const { currentPassword, newPassword } = req.body;
+    const userId = req.user.sub;
+
+    // Validate required fields
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ 
+        message: 'Both current password and new password are required' 
+      });
+    }
+
+    // Check if new password is same as current
+    if (currentPassword === newPassword) {
+      return res.status(400).json({ 
+        message: 'New password must be different from current password' 
+      });
+    }
+
+    // Create a fresh Supabase client for password verification (use ESM import)
+    const tempClient = createClient(
+      supabaseUrl,
+      supabaseAnonKey,
+      { auth: { persistSession: false } }
+    );
+
+    // Verify current password
+    const { data: signInData, error: signInError } = await tempClient.auth.signInWithPassword({
+      email: req.user.email,
+      password: currentPassword
+    });
+    
+    if (signInError) {
+      console.log('Current password verification failed:', signInError.message);
+      return res.status(400).json({ message: 'Current password is incorrect' });
+    }
+
+    // Clean up the temporary session
+    await tempClient.auth.signOut();
+
+    // Update password using admin API
+    const { data: updateData, error: passwordError } = await supabaseAdmin.auth.admin.updateUserById(userId, {
+      password: newPassword
+    });
+    
+    if (passwordError) {
+      console.error('Password update error:', passwordError);
+      return res.status(400).json({ 
+        message: 'Failed to update password: ' + passwordError.message 
+      });
+    }
+
+    console.log(`Password changed successfully for user: ${userId}`);
+    appendUserActivity(userId, {
+      type: 'password_change',
+      message: 'Changed account password',
+      details: {}
+    });
+    res.json({ message: 'Password changed successfully' });
+
+  } catch (e) {
+    console.error('Server error in password change:', e);
+    res.status(500).json({ message: 'Server error: ' + e.message });
+  }
+});
 // Updated profile fetch route to get email from auth system
 app.get('/api/auth/profile', auth(), async (req, res) => {
   try {
@@ -390,6 +745,107 @@ app.get('/api/auth/profile', auth(), async (req, res) => {
       console.error('Auth fetch error:', authError);
       return res.status(400).json({ message: authError.message });
     }
+    
+    // Debug: Log the complete Supabase auth response
+    console.log("[GET /api/auth/profile] Complete Supabase auth response:", JSON.stringify(userData, null, 2));
+    console.log("[GET /api/auth/profile] Available user fields:", Object.keys(userData.user || {}));
+    console.log("[GET /api/auth/profile] All user field values:", Object.fromEntries(
+      Object.entries(userData.user || {}).map(([key, value]) => [key, typeof value === 'string' ? value : typeof value])
+    ));
+    console.log("[GET /api/auth/profile] All user field values (detailed):", Object.fromEntries(
+      Object.entries(userData.user || {}).map(([key, value]) => [key, {
+        type: typeof value,
+        value: value,
+        isDate: value instanceof Date,
+        isString: typeof value === 'string',
+        length: typeof value === 'string' ? value.length : undefined
+      }])
+    ));
+    console.log("[GET /api/auth/profile] Searching for date fields:");
+    Object.entries(userData.user || {}).forEach(([key, value]) => {
+      if (typeof value === 'string' && (key.toLowerCase().includes('created') || key.toLowerCase().includes('date'))) {
+        console.log(`  - Found potential date field: ${key} = ${value}`);
+      }
+    });
+    console.log("[GET /api/auth/profile] All field names (case-insensitive search):");
+    Object.keys(userData.user || {}).forEach(key => {
+      console.log(`  - ${key}`);
+    });
+    console.log("[GET /api/auth/profile] Checking for common date field variations:");
+    const commonDateFields = ['created_at', 'createdAt', 'created', 'created_at_iso', 'created_at_utc', 'created_at_local'];
+    commonDateFields.forEach(field => {
+      console.log(`  - ${field}: ${userData.user?.[field]}`);
+    });
+    console.log("[GET /api/auth/profile] Checking for any field containing 'created':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('created')) {
+        console.log(`  - Found field with 'created': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/profile] Checking for any field containing 'date':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('date')) {
+        console.log(`  - Found field with 'date': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/profile] Checking for any field containing 'time':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('time')) {
+        console.log(`  - Found field with 'time': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/profile] Checking for any field containing 'stamp':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('stamp')) {
+        console.log(`  - Found field with 'stamp': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/profile] Checking for any field containing 'when':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('when')) {
+        console.log(`  - Found field with 'when': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/profile] Checking for any field containing 'at':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('at')) {
+        console.log(`  - Found field with 'at': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/profile] Checking for any field containing 'on':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('on')) {
+        console.log(`  - Found field with 'on': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/profile] Checking for any field containing 'since':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('since')) {
+        console.log(`  - Found field with 'since': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/profile] Checking for any field containing 'from':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('from')) {
+        console.log(`  - Found field with 'from': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/profile] Checking for any field containing 'to':");
+    Object.keys(userData.user || {}).forEach(key => {
+      if (key.toLowerCase().includes('to')) {
+        console.log(`  - Found field with 'to': ${key} = ${userData.user[key]}`);
+      }
+    });
+    console.log("[GET /api/auth/profile] User created_at field:", userData.user?.created_at);
+    console.log("[GET /api/auth/profile] User created_at type:", typeof userData.user?.created_at);
+    console.log("[GET /api/auth/profile] User createdAt field:", userData.user?.createdAt);
+    console.log("[GET /api/auth/profile] User created field:", userData.user?.created);
+    console.log("[GET /api/auth/profile] User created_at_iso field:", userData.user?.created_at_iso);
+    console.log("[GET /api/auth/profile] User metadata:", userData.user?.user_metadata);
+    console.log("[GET /api/auth/profile] User app_metadata:", userData.user?.app_metadata);
+    console.log("[GET /api/auth/profile] Raw created_at value:", userData.user?.created_at);
+    console.log("[GET /api/auth/profile] Raw created_at value type:", typeof userData.user?.created_at);
+    console.log("[GET /api/auth/profile] Raw created_at value length:", userData.user?.created_at?.length);
     
     // Get profile data from profiles table
     const { data: profileData, error: profileError } = await supabaseAdmin
@@ -406,7 +862,7 @@ app.get('/api/auth/profile', auth(), async (req, res) => {
       return res.status(400).json({ message: profileError.message });
     }
 
-    res.json({ 
+    const userResponse = {
       user: {
         id: profileData.id,
         name: profileData.name,
@@ -416,9 +872,30 @@ app.get('/api/auth/profile', auth(), async (req, res) => {
         location: profileData.location,
         profile_pic: profileData.profile_pic,
         avatar: profileData.profile_pic, // Include both for compatibility
-        role: profileData.role
+        role: profileData.role,
+        createdAt: formatDate(userData.user.created_at), // Add account creation date from auth.users
+        memberSince: formatDate(userData.user.created_at), // Add member since date for frontend compatibility
+        lastLoginAt: new Date().toISOString() // Add current login time
       }
+    };
+    
+    // Debug: Log the date processing
+    console.log("[GET /api/auth/profile] Date processing debug:");
+    console.log("  - Raw created_at:", userData.user.created_at);
+    console.log("  - Formatted createdAt:", userResponse.user.createdAt);
+    console.log("  - Formatted memberSince:", userResponse.user.memberSince);
+    console.log("  - lastLoginAt:", userResponse.user.lastLoginAt);
+    
+    console.log("[GET /api/auth/profile] user response:", userResponse);
+    console.log("[GET /api/auth/profile] Raw auth user data:", {
+      id: userData.user.id,
+      email: userData.user.email,
+      created_at: userData.user.created_at,
+      formatted_created_at: formatDate(userData.user.created_at)
     });
+    console.log("[GET /api/auth/profile] Complete user object being sent:", JSON.stringify(userResponse, null, 2));
+    
+    res.json(userResponse);
   } catch (e) {
     console.error('Server error:', e);
     res.status(500).json({ message: 'Server error' });
@@ -461,7 +938,7 @@ function mapTurfRowToApi(row) {
     };
   }
 
-  return {
+  const result = {
     _id: row.id,
     name: row.name,
     location: finalLocation, // This is now ALWAYS an object
@@ -470,9 +947,21 @@ function mapTurfRowToApi(row) {
     pricePerHour: row.price_per_hour,
     operatingHours: row.operating_hours || { open: '06:00', close: '22:00' },
     amenities: Array.isArray(row.amenities) ? row.amenities : [],
-    createdAt: row.created_at,
-    updatedAt: row.updated_at
+    createdAt: formatDate(row.created_at),
+    updatedAt: formatDate(row.updated_at)
   };
+  
+  // Log date formatting for debugging
+  if (row.id) {
+    console.log(`[mapTurfRowToApi] Turf ${row.id} dates:`, {
+      raw_created_at: row.created_at,
+      formatted_created_at: result.createdAt,
+      raw_updated_at: row.updated_at,
+      formatted_updated_at: result.updatedAt
+    });
+  }
+  
+  return result;
 }
 
 // Helper: map DB booking row to FE API shape
