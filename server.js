@@ -390,6 +390,21 @@ app.get('/api/user/overview', auth('user'), (req, res) => {
   res.json({ message: 'user data' });
 });
 
+/**
+ * Convert a turf database row into the API-facing turf shape.
+ *
+ * Normalizes location into an object (prefers `location_coordinates` with `address`, `latitude`, `longitude`,
+ * falls back to the legacy `location` string, or a placeholder when missing). Ensures arrays and operating hours
+ * have sensible defaults and maps snake_case DB fields to camelCase API fields.
+ *
+ * @param {Object} row - Database row for a turf. Expected properties: `id`, `name`, `location`, `location_coordinates`,
+ *   `description`, `images`, `price_per_hour`, `operating_hours`, `amenities`, `created_at`, `updated_at`.
+ * @return {Object} Normalized turf object with shape:
+ *   {
+ *     _id, name, location: { address, latitude, longitude },
+ *     description, images, pricePerHour, operatingHours, amenities, createdAt, updatedAt
+ *   }.
+ */
 function mapTurfRowToApi(row) {
   let finalLocation;
 
@@ -432,7 +447,20 @@ function mapTurfRowToApi(row) {
   };
 }
 
-// Helper: map DB booking row to FE API shape
+/**
+ * Convert a booking database row into the frontend API shape.
+ *
+ * row should be a booking row from the database (e.g., fields like id, turf_id,
+ * turf_name, user_name, user_email, user_phone, booking_date, start_time,
+ * end_time, total_amount, payment_status, booking_status, created_at).
+ *
+ * @param {Object} row - Database row for a booking.
+ * @param {Object<string,string>} [turfNameMap={}] - Optional map of turf IDs to turf names used to resolve a turf's display name when row.turf_name is absent.
+ * @return {Object} Booking object shaped for the API, containing:
+ *   - id, turfId, turfName, userName, userEmail, userPhone,
+ *     bookingDate, startTime, endTime, totalAmount, paymentStatus,
+ *     bookingStatus, createdAt
+ */
 function mapBookingRowToApi(row, turfNameMap = {}) {
   return {
     id: row.id,
@@ -451,12 +479,32 @@ function mapBookingRowToApi(row, turfNameMap = {}) {
   };
 }
 
+/**
+ * Convert a "HH:MM" time string to total minutes since midnight.
+ *
+ * Returns 0 for falsy inputs. The input is expected in "HH:MM" (or "H:MM") numeric form;
+ * non-numeric parts will produce NaN.
+ *
+ * @param {string} t - Time string in "HH:MM" format (e.g., "09:30"). Falsy values return 0.
+ * @returns {number} Total minutes represented by the time (hours * 60 + minutes).
+ */
 function timeToMinutes(t) {
   if (!t) return 0;
   const [h, m] = t.split(':').map(Number);
   return h * 60 + (m || 0);
 }
 
+/**
+ * Calculate the great-circle distance between two geographic coordinates.
+ *
+ * Uses the haversine formula to compute the shortest distance over the earth's surface.
+ *
+ * @param {number} lat1 - Latitude of the first point in decimal degrees.
+ * @param {number} lon1 - Longitude of the first point in decimal degrees.
+ * @param {number} lat2 - Latitude of the second point in decimal degrees.
+ * @param {number} lon2 - Longitude of the second point in decimal degrees.
+ * @return {number} Distance between the two points in kilometers.
+ */
 function calculateDistance(lat1, lon1, lat2, lon2) {
   const R = 6371; // Radius of the Earth in kilometers
   const dLat = (lat2 - lat1) * Math.PI / 180;
