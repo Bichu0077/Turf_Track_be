@@ -34,6 +34,10 @@ const pendingRegistrations = new Map();
 const OTP_EXPIRY_SECONDS = Number(process.env.OTP_EXPIRY_SECONDS || 600); // 10 minutes default
 const isProduction = process.env.NODE_ENV === 'production';
 
+// In-memory store for forgot-password flows
+const pendingPasswordResets = new Map();
+const pendingResetTokens = new Map();
+
 
 // Simple in-memory activity store per user (consider persisting in DB for production)
 const userActivities = new Map();
@@ -194,6 +198,33 @@ async function emailExists(rawEmail) {
   } catch (err) {
     console.error('[emailExists] error:', err);
     return false;
+  }
+}
+
+// Helper: fetch user object by email via Admin REST
+async function getUserByEmail(rawEmail) {
+  const email = String(rawEmail || '').trim().toLowerCase();
+  if (!email) return null;
+  try {
+    const url = `${supabaseUrl}/auth/v1/admin/users?email=${encodeURIComponent(email)}`;
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'apikey': supabaseServiceKey,
+        'Authorization': `Bearer ${supabaseServiceKey}`,
+      },
+    });
+    if (!resp.ok) {
+      console.error('[getUserByEmail] Admin REST error status:', resp.status);
+      return null;
+    }
+    const json = await resp.json().catch(() => ({ users: [] }));
+    const users = Array.isArray(json?.users) ? json.users : (Array.isArray(json) ? json : []);
+    const user = users.find(u => (u.email || '').toLowerCase() === email);
+    return user || null;
+  } catch (err) {
+    console.error('[getUserByEmail] error:', err);
+    return null;
   }
 }
 
@@ -395,6 +426,135 @@ app.post('/api/auth/login', async (req, res) => {
     
     res.json(userResponse);
   } catch (e) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Start forgot password: create pending reset and send OTP
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ message: 'Missing email' });
+
+    const user = await getUserByEmail(email);
+    if (!user) {
+      // For this app we return 404 so FE can show proper error
+      return res.status(404).json({ message: 'No account found with that email' });
+    }
+
+    const transactionId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const code = generateOtpCode();
+    const now = Date.now();
+    const expiresAt = now + OTP_EXPIRY_SECONDS * 1000;
+
+    pendingPasswordResets.set(transactionId, { email: user.email, code, createdAt: now, expiresAt });
+
+    try {
+      await sendOtpEmail(user.email, code);
+    } catch (mailErr) {
+      if (isProduction) {
+        console.error('Failed to send OTP email:', mailErr);
+        return res.status(500).json({ message: 'Failed to send reset code. Please try again later.' });
+      }
+    }
+
+    res.status(201).json({
+      transactionId,
+      email: user.email,
+      expiresInSeconds: OTP_EXPIRY_SECONDS,
+      ...(isProduction ? {} : { devCode: code })
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Verify forgot password OTP -> issue reset token
+app.post('/api/auth/forgot-password/verify', async (req, res) => {
+  try {
+    const { transactionId, code, otp } = req.body || {};
+    const providedCode = (otp || code || '').toString();
+    if (!transactionId || !providedCode) return res.status(400).json({ message: 'Missing transaction or code' });
+
+    const entry = pendingPasswordResets.get(transactionId);
+    if (!entry) return res.status(404).json({ message: 'No pending reset found' });
+    if (Date.now() > entry.expiresAt) {
+      pendingPasswordResets.delete(transactionId);
+      return res.status(400).json({ message: 'OTP expired. Please resend.' });
+    }
+    if (entry.code !== providedCode) return res.status(400).json({ message: 'Invalid OTP' });
+
+    const resetToken = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const now = Date.now();
+    const expiresAt = now + OTP_EXPIRY_SECONDS * 1000;
+    pendingResetTokens.set(resetToken, { email: entry.email, createdAt: now, expiresAt });
+
+    // Cleanup OTP entry
+    pendingPasswordResets.delete(transactionId);
+
+    res.json({ resetToken, email: entry.email, expiresInSeconds: OTP_EXPIRY_SECONDS });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Resend forgot password OTP
+app.post('/api/auth/forgot-password/resend', async (req, res) => {
+  try {
+    const { transactionId } = req.body || {};
+    if (!transactionId) return res.status(400).json({ message: 'Missing transaction' });
+
+    const entry = pendingPasswordResets.get(transactionId);
+    if (!entry) return res.status(404).json({ message: 'No pending reset found' });
+
+    entry.code = generateOtpCode();
+    entry.expiresAt = Date.now() + OTP_EXPIRY_SECONDS * 1000;
+    pendingPasswordResets.set(transactionId, entry);
+
+    try {
+      await sendOtpEmail(entry.email, entry.code);
+    } catch (mailErr) {
+      if (isProduction) {
+        console.error('Failed to send OTP email:', mailErr);
+        return res.status(500).json({ message: 'Failed to resend reset code. Please try again later.' });
+      }
+    }
+
+    res.json({ expiresInSeconds: OTP_EXPIRY_SECONDS, ...(isProduction ? {} : { devCode: entry.code }) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Perform password reset with reset token
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { resetToken, newPassword } = req.body || {};
+    if (!resetToken || !newPassword) return res.status(400).json({ message: 'Missing reset token or new password' });
+    if (String(newPassword).length < 6) return res.status(400).json({ message: 'Password must be at least 6 characters' });
+
+    const entry = pendingResetTokens.get(resetToken);
+    if (!entry) return res.status(400).json({ message: 'Invalid or expired reset token' });
+    if (Date.now() > entry.expiresAt) {
+      pendingResetTokens.delete(resetToken);
+      return res.status(400).json({ message: 'Invalid or expired reset token' });
+    }
+
+    const user = await getUserByEmail(entry.email);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(user.id, { password: String(newPassword) });
+    if (updateError) return res.status(400).json({ message: updateError.message });
+
+    // Cleanup reset token after successful update
+    pendingResetTokens.delete(resetToken);
+
+    res.json({ message: 'Password updated' });
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -962,6 +1122,8 @@ function mapTurfRowToApi(row) {
   }
   
   return result;
+
+
 }
 
 // Helper: map DB booking row to FE API shape
