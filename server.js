@@ -172,6 +172,8 @@ function auth(requiredRole) {
   };
 }
 
+// Images are stored as base64 data directly in the database (like profile pictures)
+
 // Routes
 app.get('/', (req, res) => res.json({ ok: true }));
 
@@ -1209,7 +1211,7 @@ app.get('/api/turfs/public', async (req, res) => {
   }
 });
 
-// Fixed create turf endpoint with better validation
+// Create turf endpoint with base64 image validation
 app.post('/api/turfs', auth('admin'), async (req, res) => {
   try {
     const { name, location, description, images, pricePerHour, operatingHours, amenities } = req.body;
@@ -1221,6 +1223,26 @@ app.post('/api/turfs', auth('admin'), async (req, res) => {
 
     if (!operatingHours || !operatingHours.open || !operatingHours.close) {
       return res.status(400).json({ message: 'Operating hours (open and close) are required' });
+    }
+
+    // Validate images if provided (similar to profile picture validation)
+    if (images && Array.isArray(images)) {
+      for (const image of images) {
+        if (image && typeof image === 'string') {
+          // Check if it's a base64 data URL
+          if (image.startsWith('data:image/')) {
+            const base64Length = image.length - (image.indexOf(',') + 1);
+            const sizeInBytes = Math.ceil((base64Length * 3) / 4);
+            const sizeInMB = sizeInBytes / (1024 * 1024);
+            
+            if (sizeInMB > 5) { // 5MB limit for images
+              return res.status(400).json({ 
+                message: `Image size (${sizeInMB.toFixed(1)}MB) is too large. Please compress the image or choose a smaller one.` 
+              });
+            }
+          }
+        }
+      }
     }
 
     // Prepare location data for both old and new format
@@ -1245,7 +1267,7 @@ app.post('/api/turfs', auth('admin'), async (req, res) => {
       location: locationString,
       location_coordinates: locationCoordinates,
       description: description || '',
-      images: Array.isArray(images) ? images.filter(img => img.trim()) : [],
+      images: Array.isArray(images) ? images.filter(img => img && img.trim()) : [],
       price_per_hour: Number(pricePerHour),
       operating_hours: operatingHours,
       amenities: Array.isArray(amenities) ? amenities.filter(a => a.trim()) : [],
@@ -1265,7 +1287,7 @@ app.post('/api/turfs', auth('admin'), async (req, res) => {
   }
 });
 
-// Fixed update turf endpoint
+// Update turf endpoint with base64 image validation
 app.put('/api/turfs/:id', auth('admin'), async (req, res) => {
   try {
     const { name, location, description, images, pricePerHour, operatingHours, amenities } = req.body;
@@ -1277,6 +1299,26 @@ app.put('/api/turfs/:id', auth('admin'), async (req, res) => {
 
     if (!operatingHours || !operatingHours.open || !operatingHours.close) {
       return res.status(400).json({ message: 'Operating hours (open and close) are required' });
+    }
+
+    // Validate images if provided (similar to profile picture validation)
+    if (images && Array.isArray(images)) {
+      for (const image of images) {
+        if (image && typeof image === 'string') {
+          // Check if it's a base64 data URL
+          if (image.startsWith('data:image/')) {
+            const base64Length = image.length - (image.indexOf(',') + 1);
+            const sizeInBytes = Math.ceil((base64Length * 3) / 4);
+            const sizeInMB = sizeInBytes / (1024 * 1024);
+            
+            if (sizeInMB > 5) { // 5MB limit for images
+              return res.status(400).json({ 
+                message: `Image size (${sizeInMB.toFixed(1)}MB) is too large. Please compress the image or choose a smaller one.` 
+              });
+            }
+          }
+        }
+      }
     }
 
     // Check ownership first
@@ -1315,7 +1357,7 @@ app.put('/api/turfs/:id', auth('admin'), async (req, res) => {
       location: locationString,
       location_coordinates: locationCoordinates,
       description: description || '',
-      images: Array.isArray(images) ? images.filter(img => img.trim()) : [],
+      images: Array.isArray(images) ? images.filter(img => img && img.trim()) : [],
       price_per_hour: Number(pricePerHour),
       operating_hours: operatingHours,
       amenities: Array.isArray(amenities) ? amenities.filter(a => a.trim()) : []
@@ -1554,7 +1596,7 @@ app.get('/api/bookings', auth('admin'), async (req, res) => {
   }
 });
 
-// Delete turf endpoint (unchanged, working correctly)
+// Delete turf endpoint
 app.delete('/api/turfs/:id', auth('admin'), async (req, res) => {
   try {
     // Check ownership
@@ -1573,7 +1615,7 @@ app.delete('/api/turfs/:id', auth('admin'), async (req, res) => {
       return res.status(403).json({ message: 'Not authorized to delete this turf' });
     }
 
-    // Delete the turf
+    // Delete the turf (images are base64 data in DB, so they're deleted automatically)
     const { error } = await supabaseAdmin
       .from('turfs')
       .delete()
