@@ -6,6 +6,7 @@ import morgan from 'morgan';
 import { createClient } from '@supabase/supabase-js';
 import nodemailer from "nodemailer";
 import crypto from 'crypto';
+import Razorpay from 'razorpay';
 
 // ...existing code...
 
@@ -27,6 +28,21 @@ if (!supabaseUrl || !supabaseAnonKey || !supabaseServiceKey) {
 
 const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, { auth: { persistSession: false } });
 const supabaseAnon = createClient(supabaseUrl, supabaseAnonKey, { auth: { persistSession: false } });
+
+// Razorpay configuration
+const razorpayKeyId = process.env.RAZORPAY_KEY_ID;
+const razorpayKeySecret = process.env.RAZORPAY_KEY_SECRET;
+
+let razorpay = null;
+if (razorpayKeyId && razorpayKeySecret) {
+  razorpay = new Razorpay({
+    key_id: razorpayKeyId,
+    key_secret: razorpayKeySecret,
+  });
+  console.log('Razorpay initialized successfully');
+} else {
+  console.warn('Razorpay configuration missing. Payment features will be disabled.');
+}
 
 // In-memory store for pending registrations and OTP codes (dev/demo usage)
 // NOTE: For production, persist this in a database or cache (e.g., Redis) with TTLs
@@ -1128,7 +1144,6 @@ function mapTurfRowToApi(row) {
 
 }
 
-// Helper: map DB booking row to FE API shape
 function mapBookingRowToApi(row, turfNameMap = {}) {
   return {
     id: row.id,
@@ -1142,9 +1157,60 @@ function mapBookingRowToApi(row, turfNameMap = {}) {
     endTime: row.end_time,
     totalAmount: Number(row.total_amount || 0),
     paymentStatus: row.payment_status || 'completed',
+    paymentMethod: row.payment_method || null,
     bookingStatus: row.booking_status || 'confirmed',
+    razorpayOrderId: row.razorpay_order_id || null,
+    razorpayPaymentId: row.razorpay_payment_id || null,
+    cancelledAt: row.cancelled_at || null,
+    cancellationReason: row.cancellation_reason || null,
+    refundAmount: row.refund_amount ? Number(row.refund_amount) : undefined,
+    canCancel: row.booking_status === 'confirmed' ? canCancelBooking(row.booking_date, row.start_time) : false,
     createdAt: row.created_at,
   };
+}
+
+// Helper function to check if booking can be cancelled (2 hours before start time)
+function canCancelBooking(bookingDate, startTime) {
+  try {
+    if (!bookingDate || !startTime) return false;
+    
+    const now = new Date();
+    // Handle both HH:mm and HH:mm:ss time formats
+    const cleanStartTime = startTime.split(':').slice(0, 2).join(':');
+    const bookingDateTime = new Date(`${bookingDate}T${cleanStartTime}:00`);
+    
+    // Check if date is valid and booking is in the future
+    if (isNaN(bookingDateTime.getTime()) || bookingDateTime <= now) {
+      return false;
+    }
+    
+    const timeDiff = bookingDateTime.getTime() - now.getTime();
+    const hoursDiff = timeDiff / (1000 * 60 * 60);
+    
+    return hoursDiff >= 2; // Can cancel if more than 2 hours before booking
+  } catch (error) {
+    console.error('Error in canCancelBooking:', error);
+    return false;
+  }
+}
+
+// Helper function to calculate refund amount
+function calculateRefundAmount(totalAmount, bookingDate, startTime) {
+  const canCancel = canCancelBooking(bookingDate, startTime);
+  return canCancel ? totalAmount : 0;
+}
+
+// Helper function to verify Razorpay signature
+function verifyRazorpaySignature(orderId, paymentId, signature) {
+  if (!razorpayKeySecret) return false;
+  
+  const body = orderId + "|" + paymentId;
+  const expectedSignature = crypto
+    .createHmac("sha256", razorpayKeySecret)
+    .update(body.toString())
+    .digest("hex");
+  
+  return expectedSignature === signature;
 }
 
 function timeToMinutes(t) {
@@ -1470,10 +1536,16 @@ app.post('/api/bookings', auth(), async (req, res) => {
       userName,
       userEmail,
       userPhone,
+      paymentMethod = 'cash',
     } = req.body || {};
 
-    if (!turfId || !date || !startTime || !endTime || !userName || !userEmail) {
+    if (!turfId || !date || !startTime || !endTime || !userName || !userEmail || !paymentMethod) {
       return res.status(400).json({ message: 'Missing required fields' });
+    }
+
+    // Validate payment method
+    if (!['cash', 'online'].includes(paymentMethod)) {
+      return res.status(400).json({ message: 'Invalid payment method' });
     }
 
     // Basic sanity: end after start and hourly increments
@@ -1492,50 +1564,101 @@ app.post('/api/bookings', auth(), async (req, res) => {
     if (turfErr) return res.status(400).json({ message: turfErr.message });
     if (!turfRow) return res.status(404).json({ message: 'Turf not found' });
 
-    // Availability check: no overlapping non-cancelled bookings for same date
+    // Availability check: no overlapping confirmed bookings for same date
+    // (tentative bookings older than 15 minutes are ignored)
+    const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    
     const { data: existing, error: conflictErr } = await supabaseAdmin
       .from('bookings')
-      .select('start_time, end_time')
+      .select('start_time, end_time, booking_status, created_at')
       .eq('turf_id', turfId)
       .eq('booking_date', date)
       .neq('booking_status', 'cancelled');
+    
     if (conflictErr) return res.status(400).json({ message: conflictErr.message });
+    
     const conflict = (existing || []).some(b => {
+      // Skip old tentative bookings (expired)
+      if (b.booking_status === 'tentative' && b.created_at < fifteenMinutesAgo) {
+        return false;
+      }
+      
       const bs = timeToMinutes(b.start_time);
       const be = timeToMinutes(b.end_time);
       // Overlap if start < be and end > bs
       return sMin < be && eMin > bs;
     });
+    
     if (conflict) return res.status(409).json({ message: 'Selected time overlaps an existing booking' });
 
     // Default total if not provided
     const durationHours = (eMin - sMin) / 60;
     const computedTotal = Number(totalAmount ?? (Number(turfRow.price_per_hour) * durationHours));
 
-    const payload = {
-      turf_id: turfId,
-      turf_name: turfRow.name, // Fix: include turf_name
-      user_id: req.user.sub,
-      user_name: userName,
-      user_email: userEmail,
-      user_phone: userPhone || null,
-      booking_date: date,
-      start_time: startTime,
-      end_time: endTime,
-      total_amount: computedTotal,
-      payment_status: 'completed',
-      booking_status: 'confirmed',
-    };
+    // Set payment status and booking status based on payment method
+    let paymentStatus, bookingStatus;
+    
+    if (paymentMethod === 'cash') {
+      // Cash payments: create booking immediately with pending payment
+      paymentStatus = 'pending';
+      bookingStatus = 'confirmed';
+      
+      // Create the booking record for cash payments
+      const payload = {
+        turf_id: turfId,
+        turf_name: turfRow.name,
+        user_id: req.user.sub,
+        user_name: userName,
+        user_email: userEmail,
+        user_phone: userPhone || null,
+        booking_date: date,
+        start_time: startTime,
+        end_time: endTime,
+        total_amount: computedTotal,
+        payment_status: paymentStatus,
+        payment_method: paymentMethod,
+        booking_status: bookingStatus,
+      };
 
-    const { data: created, error: createErr } = await supabaseAdmin
-      .from('bookings')
-      .insert(payload)
-      .select('*')
-      .single();
-    if (createErr) return res.status(400).json({ message: createErr.message });
+      const { data: created, error: createErr } = await supabaseAdmin
+        .from('bookings')
+        .insert(payload)
+        .select('*')
+        .single();
+      if (createErr) return res.status(400).json({ message: createErr.message });
 
-    const api = mapBookingRowToApi(created, { [turfId]: turfRow.name });
-    res.status(201).json({ booking: api });
+      const api = mapBookingRowToApi(created, { [turfId]: turfRow.name });
+      res.status(201).json({ booking: api });
+      
+    } else {
+      // Online payments: don't create booking record yet, just return booking details for payment
+      // The booking will be created in the payment verification endpoint
+      paymentStatus = 'pending';
+      bookingStatus = 'tentative';
+      
+      const bookingDetails = {
+        turfId,
+        turfName: turfRow.name,
+        userId: req.user.sub,
+        userName,
+        userEmail,
+        userPhone: userPhone || null,
+        bookingDate: date,
+        startTime,
+        endTime,
+        totalAmount: computedTotal,
+        paymentMethod,
+        paymentStatus,
+        bookingStatus,
+      };
+      
+      // Return booking details for payment processing, but don't create DB record yet
+      res.status(200).json({ 
+        booking: bookingDetails,
+        message: 'Booking details prepared. Complete payment to confirm booking.',
+        requiresPayment: true
+      });
+    }
   } catch (e) {
     console.error('Error creating booking:', e);
     res.status(500).json({ message: 'Server error' });
@@ -1596,6 +1719,525 @@ app.get('/api/bookings', auth('admin'), async (req, res) => {
   }
 });
 
+// Payment endpoints
+// Test endpoint for debugging
+app.get('/api/payments/test', (req, res) => {
+  res.json({ message: 'Payment endpoints are working', timestamp: new Date() });
+});
+
+// Create booking with payment for online payments (new flow)
+app.post('/api/payments/create-booking-with-payment', auth(), async (req, res) => {
+  console.log('[create-booking-with-payment] Endpoint called with body:', req.body);
+  try {
+    if (!razorpay) {
+      return res.status(503).json({ message: 'Payment service unavailable' });
+    }
+
+    const {
+      turfId,
+      date,
+      startTime,
+      endTime,
+      totalAmount,
+      userName,
+      userEmail,
+      userPhone,
+    } = req.body || {};
+
+    if (!turfId || !date || !startTime || !endTime || !userName || !userEmail) {
+      return res.status(400).json({ message: 'Missing required fields' });
+    }
+
+    // Basic sanity: end after start and hourly increments
+    const sMin = timeToMinutes(startTime);
+    const eMin = timeToMinutes(endTime);
+    if (!(eMin > sMin) || ((eMin - sMin) % 60) !== 0) {
+      return res.status(400).json({ message: 'Invalid time range' });
+    }
+
+    // Ensure turf exists
+    const { data: turfRow, error: turfErr } = await supabaseAdmin
+      .from('turfs')
+      .select('id, name, operating_hours, price_per_hour')
+      .eq('id', turfId)
+      .single();
+    if (turfErr) return res.status(400).json({ message: turfErr.message });
+    if (!turfRow) return res.status(404).json({ message: 'Turf not found' });
+
+    // Availability check: no overlapping confirmed bookings for same date
+    const { data: existing, error: conflictErr } = await supabaseAdmin
+      .from('bookings')
+      .select('start_time, end_time, booking_status, created_at')
+      .eq('turf_id', turfId)
+      .eq('booking_date', date)
+      .neq('booking_status', 'cancelled');
+    
+    if (conflictErr) return res.status(400).json({ message: conflictErr.message });
+    
+    const conflict = (existing || []).some(b => {
+      const bs = timeToMinutes(b.start_time);
+      const be = timeToMinutes(b.end_time);
+      return sMin < be && eMin > bs;
+    });
+    
+    if (conflict) return res.status(409).json({ message: 'Selected time overlaps an existing booking' });
+
+    // Default total if not provided
+    const durationHours = (eMin - sMin) / 60;
+    const computedTotal = Number(totalAmount ?? (Number(turfRow.price_per_hour) * durationHours));
+
+    // Create Razorpay order with booking details in notes
+    const timestamp = Date.now().toString();
+    const shortReceipt = `new_${timestamp}`.slice(0, 40);
+    
+    const options = {
+      amount: Math.round(computedTotal * 100), // Amount in paise
+      currency: 'INR',
+      receipt: shortReceipt,
+      notes: {
+        // Store all booking details in notes for later creation
+        type: 'new_booking',
+        turfId: turfId,
+        turfName: turfRow.name,
+        userId: req.user.sub,
+        userName: userName,
+        userEmail: userEmail,
+        userPhone: userPhone || '',
+        bookingDate: date,
+        startTime: startTime,
+        endTime: endTime,
+        totalAmount: computedTotal.toString(),
+        paymentMethod: 'online',
+      }
+    };
+
+    const order = await razorpay.orders.create(options);
+
+    // Return payment details for frontend
+    res.json({
+      orderId: order.id,
+      amount: computedTotal,
+      currency: 'INR',
+      key: razorpayKeyId, // Add the Razorpay key for frontend
+      name: 'TurfTrack',
+      description: `Booking for ${turfRow.name}`,
+      prefill: {
+        name: userName,
+        email: userEmail,
+        contact: userPhone || '',
+      },
+      theme: {
+        color: '#3b82f6'
+      },
+      bookingDetails: {
+        turfName: turfRow.name,
+        date,
+        startTime,
+        endTime,
+        totalAmount: computedTotal,
+      }
+    });
+  } catch (error) {
+    console.error('Error creating payment order:', error);
+    res.status(500).json({ message: 'Failed to create payment order' });
+  }
+});
+
+// Create Razorpay order for payment (existing bookings)
+app.post('/api/payments/create-order', auth(), async (req, res) => {
+  try {
+    if (!razorpay) {
+      return res.status(503).json({ message: 'Payment service unavailable' });
+    }
+
+    const { bookingId, amount } = req.body;
+    
+    if (!bookingId || !amount) {
+      return res.status(400).json({ message: 'Missing bookingId or amount' });
+    }
+
+    // Verify booking exists and belongs to user
+    const { data: booking, error: bookingError } = await supabaseAdmin
+      .from('bookings')
+      .select('*')
+      .eq('id', bookingId)
+      .eq('user_id', req.user.sub)
+      .single();
+
+    if (bookingError || !booking) {
+      return res.status(404).json({ message: 'Booking not found' });
+    }
+
+    if (booking.payment_status === 'completed') {
+      return res.status(400).json({ message: 'Payment already completed' });
+    }
+
+    if (booking.booking_status === 'cancelled') {
+      return res.status(400).json({ message: 'Cannot pay for cancelled booking' });
+    }
+
+    // Create Razorpay order
+    // Generate a short receipt ID (max 40 chars) - use timestamp + short booking ID suffix
+    const timestamp = Date.now().toString();
+    const bookingIdSuffix = bookingId.slice(-8); // Last 8 characters of booking ID
+    const shortReceipt = `bk_${timestamp}_${bookingIdSuffix}`.slice(0, 40); // Ensure max 40 chars
+    
+    const options = {
+      amount: Math.round(amount * 100), // Amount in paise
+      currency: 'INR',
+      receipt: shortReceipt,
+      notes: {
+        bookingId: bookingId,
+        userId: req.user.sub,
+        turfName: booking.turf_name,
+        bookingDate: booking.booking_date,
+        startTime: booking.start_time,
+        endTime: booking.end_time,
+      }
+    };
+
+    const order = await razorpay.orders.create(options);
+
+    // Update booking with Razorpay order ID
+    await supabaseAdmin
+      .from('bookings')
+      .update({ razorpay_order_id: order.id })
+      .eq('id', bookingId);
+
+    // Return payment details for frontend
+    const paymentDetails = {
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      key: razorpayKeyId,
+      name: 'TurfTrack',
+      description: `Turf booking for ${booking.turf_name}`,
+      image: '/logo.png', // You can add your logo URL here
+      prefill: {
+        name: booking.user_name,
+        email: booking.user_email,
+        contact: booking.user_phone || '',
+      },
+      theme: {
+        color: '#16a34a', // TurfTrack green
+      }
+    };
+
+    res.json({ paymentDetails });
+  } catch (error) {
+    console.error('Error creating payment order:', error);
+    res.status(500).json({ message: 'Failed to create payment order' });
+  }
+});
+
+// Verify Razorpay payment
+app.post('/api/payments/verify', auth(), async (req, res) => {
+  try {
+    if (!razorpay) {
+      return res.status(503).json({ message: 'Payment service unavailable' });
+    }
+
+    const { bookingId, razorpayResponse } = req.body;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = razorpayResponse;
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ message: 'Missing payment verification data' });
+    }
+
+    // Verify Razorpay signature
+    const isValidSignature = verifyRazorpaySignature(
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature
+    );
+
+    if (!isValidSignature) {
+      return res.status(400).json({ message: 'Invalid payment signature' });
+    }
+
+    // Fetch order details from Razorpay to get notes
+    const order = await razorpay.orders.fetch(razorpay_order_id);
+    
+    // Check if this is a new booking (from create-booking-with-payment) or existing booking
+    if (order.notes.type === 'new_booking') {
+      // This is a new booking - create the booking record now
+      console.log('Creating new booking from payment verification');
+      
+      // Double-check availability again before creating booking
+      const { data: existing, error: conflictErr } = await supabaseAdmin
+        .from('bookings')
+        .select('start_time, end_time, booking_status')
+        .eq('turf_id', order.notes.turfId)
+        .eq('booking_date', order.notes.bookingDate)
+        .neq('booking_status', 'cancelled');
+      
+      if (!conflictErr) {
+        const sMin = timeToMinutes(order.notes.startTime);
+        const eMin = timeToMinutes(order.notes.endTime);
+        const conflict = (existing || []).some(b => {
+          const bs = timeToMinutes(b.start_time);
+          const be = timeToMinutes(b.end_time);
+          return sMin < be && eMin > bs;
+        });
+        
+        if (conflict) {
+          return res.status(409).json({ message: 'Time slot no longer available' });
+        }
+      }
+
+      // Create the booking record
+      const bookingPayload = {
+        turf_id: order.notes.turfId,
+        turf_name: order.notes.turfName,
+        user_id: order.notes.userId,
+        user_name: order.notes.userName,
+        user_email: order.notes.userEmail,
+        user_phone: order.notes.userPhone || null,
+        booking_date: order.notes.bookingDate,
+        start_time: order.notes.startTime,
+        end_time: order.notes.endTime,
+        total_amount: parseFloat(order.notes.totalAmount),
+        payment_status: 'completed',
+        payment_method: 'online',
+        booking_status: 'confirmed',
+        razorpay_order_id: razorpay_order_id,
+        razorpay_payment_id: razorpay_payment_id,
+      };
+
+      const { data: newBooking, error: createError } = await supabaseAdmin
+        .from('bookings')
+        .insert(bookingPayload)
+        .select('*')
+        .single();
+
+      if (createError) {
+        console.error('Error creating booking after payment:', createError);
+        return res.status(500).json({ message: 'Payment successful but booking creation failed' });
+      }
+
+      const api = mapBookingRowToApi(newBooking);
+      res.json({ booking: api, message: 'Payment successful and booking created' });
+      
+    } else {
+      // This is an existing booking - update it
+      console.log('Updating existing booking payment status');
+      
+      if (!bookingId) {
+        return res.status(400).json({ message: 'BookingId required for existing booking payments' });
+      }
+
+      // Verify booking exists and belongs to user
+      const { data: booking, error: bookingError } = await supabaseAdmin
+        .from('bookings')
+        .select('*')
+        .eq('id', bookingId)
+        .eq('user_id', req.user.sub)
+        .single();
+
+      if (bookingError || !booking) {
+        return res.status(404).json({ message: 'Booking not found' });
+      }
+
+      if (booking.razorpay_order_id !== razorpay_order_id) {
+        return res.status(400).json({ message: 'Order ID mismatch' });
+      }
+
+      // Update booking with payment details and confirm tentative booking
+      const { data: updatedBooking, error: updateError } = await supabaseAdmin
+        .from('bookings')
+        .update({
+          payment_status: 'completed',
+          booking_status: 'confirmed', // Confirm tentative booking
+          razorpay_payment_id: razorpay_payment_id,
+        })
+        .eq('id', bookingId)
+        .select('*')
+        .single();
+
+      if (updateError) {
+        console.error('Error updating booking payment status:', updateError);
+        return res.status(500).json({ message: 'Failed to update payment status' });
+      }
+
+      const api = mapBookingRowToApi(updatedBooking);
+      res.json({ booking: api, message: 'Payment successful and booking confirmed' });
+    }
+  } catch (error) {
+    console.error('Error verifying payment:', error);
+    res.status(500).json({ message: 'Payment verification failed' });
+  }
+});
+
+// Pay later endpoint (for cash bookings that want to pay online)
+app.post('/api/bookings/:id/pay-later', auth(), async (req, res) => {
+  try {
+    if (!razorpay) {
+      return res.status(503).json({ message: 'Payment service unavailable' });
+    }
+
+    const bookingId = req.params.id;
+
+    // Verify booking exists and belongs to user
+    const { data: booking, error: bookingError } = await supabaseAdmin
+      .from('bookings')
+      .select('*')
+      .eq('id', bookingId)
+      .eq('user_id', req.user.sub)
+      .single();
+
+    if (bookingError || !booking) {
+      return res.status(404).json({ message: 'Booking not found' });
+    }
+
+    if (booking.payment_status === 'completed') {
+      return res.status(400).json({ message: 'Payment already completed' });
+    }
+
+    if (booking.booking_status === 'cancelled') {
+      return res.status(400).json({ message: 'Cannot pay for cancelled booking' });
+    }
+
+    if (booking.payment_method !== 'cash') {
+      return res.status(400).json({ message: 'This booking is not eligible for pay later' });
+    }
+
+    // Create Razorpay order
+    // Generate a short receipt ID (max 40 chars) - use timestamp + short booking ID suffix
+    const timestamp = Date.now().toString();
+    const bookingIdSuffix = bookingId.slice(-8); // Last 8 characters of booking ID
+    const shortReceipt = `pl_${timestamp}_${bookingIdSuffix}`.slice(0, 40); // Ensure max 40 chars
+    
+    const options = {
+      amount: Math.round(booking.total_amount * 100), // Amount in paise
+      currency: 'INR',
+      receipt: shortReceipt,
+      notes: {
+        bookingId: bookingId,
+        userId: req.user.sub,
+        turfName: booking.turf_name,
+        bookingDate: booking.booking_date,
+        startTime: booking.start_time,
+        endTime: booking.end_time,
+        payLater: true,
+      }
+    };
+
+    const order = await razorpay.orders.create(options);
+
+    // Update booking with Razorpay order ID and change payment method to online
+    await supabaseAdmin
+      .from('bookings')
+      .update({ 
+        razorpay_order_id: order.id,
+        payment_method: 'online'
+      })
+      .eq('id', bookingId);
+
+    // Return payment details for frontend
+    const paymentDetails = {
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      key: razorpayKeyId,
+      name: 'TurfTrack',
+      description: `Pay later for ${booking.turf_name} booking`,
+      image: '/logo.png',
+      prefill: {
+        name: booking.user_name,
+        email: booking.user_email,
+        contact: booking.user_phone || '',
+      },
+      theme: {
+        color: '#16a34a',
+      }
+    };
+
+    res.json({ paymentDetails });
+  } catch (error) {
+    console.error('Error creating pay later order:', error);
+    res.status(500).json({ message: 'Failed to create pay later order' });
+  }
+});
+
+// Cancel booking endpoint
+app.post('/api/bookings/:id/cancel', auth(), async (req, res) => {
+  try {
+    const bookingId = req.params.id;
+    const { reason } = req.body || {};
+
+    // Verify booking exists and belongs to user
+    const { data: booking, error: bookingError } = await supabaseAdmin
+      .from('bookings')
+      .select('*')
+      .eq('id', bookingId)
+      .eq('user_id', req.user.sub)
+      .single();
+
+    if (bookingError || !booking) {
+      return res.status(404).json({ message: 'Booking not found' });
+    }
+
+    if (booking.booking_status === 'cancelled') {
+      return res.status(400).json({ message: 'Booking is already cancelled' });
+    }
+
+    // Check if booking is in the future
+    const now = new Date();
+    const cleanStartTime = booking.start_time.split(':').slice(0, 2).join(':'); // Handle HH:mm:ss format
+    const bookingDateTime = new Date(`${booking.booking_date}T${cleanStartTime}:00`);
+    
+    const isInFuture = bookingDateTime > now && !isNaN(bookingDateTime.getTime());
+    
+    if (!isInFuture) {
+      return res.status(400).json({ message: 'Cannot cancel past or invalid bookings' });
+    }
+
+    // Check if booking can be cancelled (2 hours before start time)
+    const timeDiff = bookingDateTime.getTime() - now.getTime();
+    const hoursDiff = timeDiff / (1000 * 60 * 60);
+    const isWithinRefundWindow = hoursDiff >= 2;
+    
+    // Calculate refund amount - only for completed payments within refund window
+    let refundAmount = 0;
+    if (booking.payment_status === 'completed' && isWithinRefundWindow) {
+      refundAmount = booking.total_amount;
+    }
+
+    const updateData = {
+      booking_status: 'cancelled',
+      cancelled_at: new Date().toISOString(),
+      cancellation_reason: reason || null,
+      refund_amount: refundAmount,
+    };
+
+    // If payment was completed and refund is applicable, mark payment as refunded
+    if (booking.payment_status === 'completed' && refundAmount > 0) {
+      updateData.payment_status = 'refunded';
+    }
+
+    const { data: updatedBooking, error: updateError } = await supabaseAdmin
+      .from('bookings')
+      .update(updateData)
+      .eq('id', bookingId)
+      .select('*')
+      .single();
+
+    if (updateError) {
+      console.error('Error cancelling booking:', updateError);
+      return res.status(500).json({ message: 'Failed to cancel booking' });
+    }
+
+    // TODO: Implement actual refund processing with Razorpay if payment was made online
+    // For now, we just mark it as refunded in the database
+
+    const api = mapBookingRowToApi(updatedBooking);
+    res.json({ booking: api });
+  } catch (error) {
+    console.error('Error cancelling booking:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // Delete turf endpoint
 app.delete('/api/turfs/:id', auth('admin'), async (req, res) => {
   try {
@@ -1627,6 +2269,75 @@ app.delete('/api/turfs/:id', auth('admin'), async (req, res) => {
   } catch (e) {
     console.error('Error deleting turf:', e);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Cleanup function for expired tentative bookings
+async function cleanupExpiredTentativeBookings() {
+  try {
+    const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    
+    const { error } = await supabaseAdmin
+      .from('bookings')
+      .update({ booking_status: 'cancelled' })
+      .eq('booking_status', 'tentative')
+      .lt('created_at', fifteenMinutesAgo);
+    
+    if (error) {
+      console.error('Error cleaning up expired tentative bookings:', error);
+    } else {
+      console.log('Cleaned up expired tentative bookings');
+    }
+  } catch (e) {
+    console.error('Error in cleanup function:', e);
+  }
+}
+
+// Run cleanup every 5 minutes
+setInterval(cleanupExpiredTentativeBookings, 5 * 60 * 1000);
+
+// Database migration endpoint - Update booking_status constraint
+app.post('/api/migrate/update-booking-status-constraint', auth(), async (req, res) => {
+  try {
+    console.log('Running database migration: update booking_status constraint');
+    
+    // First, let's check current constraints
+    const { data: constraints, error: constraintError } = await supabaseAdmin
+      .from('pg_constraint')
+      .select('conname, consrc')
+      .eq('conname', 'bookings_booking_status_check');
+    
+    console.log('Current constraint:', constraints);
+    
+    // Use raw SQL to update the constraint
+    // Note: This requires the SQL execution to be enabled in your Supabase project
+    const sqlCommands = [
+      'ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_booking_status_check;',
+      "ALTER TABLE bookings ADD CONSTRAINT bookings_booking_status_check CHECK (booking_status IN ('confirmed', 'cancelled', 'tentative'));"
+    ];
+    
+    console.log('Migration instructions created. Please run these SQL commands in your Supabase SQL Editor:');
+    console.log(sqlCommands.join('\n'));
+    
+    res.json({ 
+      success: true, 
+      message: 'Migration instructions generated. Please run the SQL commands in your Supabase dashboard.',
+      sqlCommands: sqlCommands,
+      instructions: [
+        '1. Go to your Supabase Dashboard',
+        '2. Navigate to SQL Editor',
+        '3. Run the provided SQL commands',
+        '4. This will update the constraint to allow tentative bookings'
+      ]
+    });
+    
+  } catch (error) {
+    console.error('Migration preparation error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Migration preparation failed', 
+      details: error.message 
+    });
   }
 });
 
