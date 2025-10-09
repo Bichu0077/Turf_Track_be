@@ -1236,7 +1236,7 @@ function mapTurfRowToApi(row) {
     locationCoordinates: finalLocation, // Keep object version for coordinate features
     description: row.description || '',
     images: Array.isArray(row.images) ? row.images : [],
-    pricePerHour: row.price_per_hour,
+    pricePerHour: Number(row.price_per_hour) || 0, // Ensure it's a number
     operatingHours: row.operating_hours || { open: '06:00', close: '22:00' },
     amenities: Array.isArray(row.amenities) ? row.amenities : [],
     createdAt: formatDate(row.created_at),
@@ -1280,6 +1280,10 @@ function mapBookingRowToApi(row, turfNameMap = {}) {
     refundAmount: row.refund_amount ? Number(row.refund_amount) : undefined,
     canCancel: row.booking_status === 'confirmed' ? canCancelBooking(row.booking_date, row.start_time) : false,
     createdAt: row.created_at,
+    // Owner settlement information
+    ownerSettlementStatus: row.owner_settlement_status || 'pending',
+    payoutAmount: row.payout_amount ? Number(row.payout_amount) : null,
+    settledAt: row.settled_at || null,
   };
 }
 
@@ -1349,6 +1353,7 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 // Fixed public turfs endpoint
 app.get('/api/turfs/public', async (req, res) => {
   try {
+    console.log('[GET /api/turfs/public] Request received with query:', req.query);
     const { lat, lon, radius } = req.query;
     
     const { data, error } = await supabaseAdmin
@@ -1356,9 +1361,15 @@ app.get('/api/turfs/public', async (req, res) => {
       .select('*')
       .order('created_at', { ascending: false });
       
+    console.log('[GET /api/turfs/public] Database query result:', { 
+      dataCount: data?.length || 0, 
+      error: error?.message || null 
+    });
+      
     if (error) return res.status(400).json({ message: error.message });
 
     let turfs = (data || []).map(mapTurfRowToApi);
+    console.log('[GET /api/turfs/public] Mapped turfs count:', turfs.length);
 
     // If location filtering is requested, filter by radius
     if (lat && lon && radius) {
@@ -1384,6 +1395,7 @@ app.get('/api/turfs/public', async (req, res) => {
       });
     }
 
+    console.log('[GET /api/turfs/public] Final turfs count after filtering:', turfs.length);
     res.json({ turfs });
   } catch (e) {
     console.error('Error fetching public turfs:', e);
@@ -1732,6 +1744,9 @@ app.post('/api/bookings', auth(), async (req, res) => {
         payment_status: paymentStatus,
         payment_method: paymentMethod,
         booking_status: bookingStatus,
+        // Cash payments don't need owner settlements (handled directly at turf)
+        payout_amount: null,
+        owner_settlement_status: 'completed', // Cash payments are settled immediately
       };
 
       const { data: created, error: createErr } = await supabaseAdmin
@@ -2116,6 +2131,9 @@ app.post('/api/payments/verify', auth(), async (req, res) => {
         booking_status: 'confirmed',
         razorpay_order_id: razorpay_order_id,
         razorpay_payment_id: razorpay_payment_id,
+        // Full amount goes to owner for online payments
+        payout_amount: parseFloat(order.notes.totalAmount),
+        owner_settlement_status: 'pending',
       };
 
       const { data: newBooking, error: createError } = await supabaseAdmin
@@ -2163,6 +2181,9 @@ app.post('/api/payments/verify', auth(), async (req, res) => {
           payment_status: 'completed',
           booking_status: 'confirmed', // Confirm tentative booking
           razorpay_payment_id: razorpay_payment_id,
+          // Full amount goes to owner if not already set
+          payout_amount: booking.payout_amount || booking.total_amount,
+          owner_settlement_status: 'pending',
         })
         .eq('id', bookingId)
         .select('*')
@@ -2629,22 +2650,12 @@ app.get('/api/superadmin/payments', auth('superadmin'), async (req, res) => {
 app.get('/api/superadmin/turfs', auth('superadmin'), async (req, res) => {
   try {
     console.log('[SuperAdmin] All turfs requested by user:', req.user.id);
-    
-    // Log activity
-    appendUserActivity(req.user.id, {
-      type: 'superadmin_view_turfs',
-      message: 'Viewed all platform turfs',
-      details: { timestamp: new Date().toISOString() }
-    });
 
     const { page = 1, limit = 50, search = '' } = req.query;
     
     let query = supabaseAdmin
       .from('turfs')
-      .select(`
-        *,
-        owner_profile:profiles!turfs_owner_fkey(name, email)
-      `)
+      .select('*')
       .order('created_at', { ascending: false });
 
     // Apply search filter
@@ -2656,23 +2667,48 @@ app.get('/api/superadmin/turfs', auth('superadmin'), async (req, res) => {
     const offset = (Number(page) - 1) * Number(limit);
     query = query.range(offset, offset + Number(limit) - 1);
 
-    const { data, error, count } = await query;
-    if (error) return res.status(400).json({ message: error.message });
+    const { data, error } = await query;
+    if (error) {
+      console.error('SuperAdmin turfs query error:', error);
+      return res.status(400).json({ message: error.message });
+    }
 
-    const turfs = (data || []).map(turf => ({
-      ...mapTurfRowToApi(turf),
-      ownerName: turf.owner_profile?.name || 'Unknown',
-      ownerEmail: turf.owner_profile?.email || 'Unknown',
-      ownerId: turf.owner,
-    }));
+    console.log('[SuperAdmin] Turfs data retrieved:', data?.length || 0);
+
+    // Get owner information for all turfs
+    const ownerIds = Array.from(new Set((data || []).map(t => t.owner).filter(Boolean)));
+    let ownerMap = {};
+    
+    if (ownerIds.length > 0) {
+      const { data: owners } = await supabaseAdmin
+        .from('profiles')
+        .select('id, name, email')
+        .in('id', ownerIds);
+      
+      if (owners) {
+        ownerMap = Object.fromEntries(owners.map(o => [o.id, { name: o.name, email: o.email }]));
+      }
+    }
+
+    const turfs = (data || []).map(turf => {
+      const ownerInfo = ownerMap[turf.owner] || { name: 'Unknown Owner', email: 'unknown@example.com' };
+      return {
+        ...mapTurfRowToApi(turf),
+        ownerName: ownerInfo.name,
+        ownerEmail: ownerInfo.email,
+        ownerId: turf.owner || 'unknown',
+      };
+    });
+
+    console.log('[SuperAdmin] Mapped turfs:', turfs.length);
 
     res.json({ 
       turfs,
       pagination: {
         page: Number(page),
         limit: Number(limit),
-        total: count || 0,
-        totalPages: Math.ceil((count || 0) / Number(limit))
+        total: data?.length || 0,
+        totalPages: Math.ceil((data?.length || 0) / Number(limit))
       }
     });
   } catch (e) {
@@ -2994,6 +3030,631 @@ app.post('/api/migrate/update-booking-status-constraint', auth(), async (req, re
       error: 'Migration preparation failed', 
       details: error.message 
     });
+  }
+});
+
+// Super Admin - Fund Transfer System
+// ==================================
+
+// Get fund transfer history
+app.get('/api/superadmin/fund-transfers', auth('superadmin'), async (req, res) => {
+  try {
+    console.log('[SuperAdmin] Fund transfers requested by user:', req.user.id);
+    
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_view_fund_transfers',
+      message: 'Viewed fund transfer history',
+      details: { timestamp: new Date().toISOString() }
+    });
+
+    // Get all fund transfers from the database
+    const { data, error } = await supabaseAdmin
+      .from('fund_transfers')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Fund transfers query error:', error);
+      return res.status(400).json({ message: error.message });
+    }
+
+    res.json({ transfers: data || [] });
+  } catch (e) {
+    console.error('SuperAdmin fund transfers error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Process weekly fund transfers
+app.post('/api/superadmin/process-weekly-transfers', auth('superadmin'), async (req, res) => {
+  try {
+    console.log('[SuperAdmin] Processing weekly transfers by user:', req.user.id);
+    
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_process_weekly_transfers',
+      message: 'Processed weekly fund transfers',
+      details: { timestamp: new Date().toISOString() }
+    });
+
+    // Allow custom date range or use current week
+    let weekStart, weekEnd;
+    
+    if (req.body.startDate && req.body.endDate) {
+      // Use custom date range
+      weekStart = new Date(req.body.startDate);
+      weekStart.setHours(0, 0, 0, 0);
+      weekEnd = new Date(req.body.endDate);
+      weekEnd.setHours(23, 59, 59, 999);
+      console.log('Using custom date range:', weekStart.toISOString(), 'to', weekEnd.toISOString());
+    } else {
+      // Calculate the current week (Monday to Sunday)
+      const now = new Date();
+      const currentDay = now.getDay();
+      const daysToMonday = currentDay === 0 ? 6 : currentDay - 1; // Sunday is 0, so 6 days to Monday
+      weekStart = new Date(now);
+      weekStart.setDate(now.getDate() - daysToMonday);
+      weekStart.setHours(0, 0, 0, 0);
+      
+      weekEnd = new Date(weekStart);
+      weekEnd.setDate(weekStart.getDate() + 6);
+      weekEnd.setHours(23, 59, 59, 999);
+      console.log('Using current week:', weekStart.toISOString(), 'to', weekEnd.toISOString());
+    }
+
+    console.log('Processing transfers for week:', weekStart.toISOString(), 'to', weekEnd.toISOString());
+
+    // Get all turf owners (users with role 'admin')
+    const { data: turfOwners, error: ownersError } = await supabaseAdmin
+      .from('profiles')
+      .select('id, name, email')
+      .eq('role', 'admin');
+
+    if (ownersError) {
+      console.error('Error fetching turf owners:', ownersError);
+      return res.status(400).json({ message: ownersError.message });
+    }
+
+    if (!turfOwners || turfOwners.length === 0) {
+      console.log('No turf owners found');
+      return res.json({ 
+        transfers: [],
+        message: 'No turf owners found. Make sure you have users with role "admin".',
+        weekStart: weekStart.toISOString(),
+        weekEnd: weekEnd.toISOString()
+      });
+    }
+
+    console.log(`Found ${turfOwners.length} turf owners`);
+    const transfers = [];
+
+    // Process each turf owner
+    for (const owner of turfOwners || []) {
+      try {
+        // Get all completed bookings for this owner's turfs in the current week
+        const { data: bookings, error: bookingsError } = await supabaseAdmin
+          .from('bookings')
+          .select('id, total_amount, turf_id, created_at')
+          .eq('payment_status', 'completed')
+          .eq('booking_status', 'confirmed')
+          .gte('created_at', weekStart.toISOString())
+          .lte('created_at', weekEnd.toISOString());
+
+        if (bookingsError) {
+          console.error(`Error fetching bookings for owner ${owner.id}:`, bookingsError);
+          continue;
+        }
+
+        // Get owner's turfs to filter bookings
+        const { data: ownerTurfs, error: turfsError } = await supabaseAdmin
+          .from('turfs')
+          .select('id')
+          .eq('owner', owner.id);
+
+        if (turfsError) {
+          console.error(`Error fetching turfs for owner ${owner.id}:`, turfsError);
+          continue;
+        }
+
+        const ownerTurfIds = (ownerTurfs || []).map(t => t.id);
+        const ownerBookings = (bookings || []).filter(b => ownerTurfIds.includes(b.turf_id));
+
+        if (ownerBookings.length === 0) {
+          console.log(`No bookings found for owner ${owner.name} in this week`);
+          continue;
+        }
+
+        console.log(`Found ${ownerBookings.length} bookings for owner ${owner.name}`);
+
+        // Calculate earnings
+        const totalEarnings = ownerBookings.reduce((sum, booking) => sum + (booking.total_amount || 0), 0);
+        const netAmount = totalEarnings; // Full amount goes to owner
+
+        // Create fund transfer record
+        const transferData = {
+          turf_owner_id: owner.id,
+          turf_owner_name: owner.name,
+          turf_owner_email: owner.email,
+          total_earnings: totalEarnings,
+          net_amount: netAmount,
+          week_start: weekStart.toISOString(),
+          week_end: weekEnd.toISOString(),
+          status: 'pending',
+          created_at: new Date().toISOString()
+        };
+
+        // Insert fund transfer record
+        const { data: transfer, error: transferError } = await supabaseAdmin
+          .from('fund_transfers')
+          .insert(transferData)
+          .select()
+          .single();
+
+        if (transferError) {
+          console.error(`Error creating transfer for owner ${owner.id}:`, transferError);
+          continue;
+        }
+
+        transfers.push({
+          id: transfer.id,
+          turfOwnerId: transfer.turf_owner_id,
+          turfOwnerName: transfer.turf_owner_name,
+          turfOwnerEmail: transfer.turf_owner_email,
+          totalEarnings: transfer.total_earnings,
+          netAmount: transfer.net_amount,
+          weekStart: transfer.week_start,
+          weekEnd: transfer.week_end,
+          status: transfer.status,
+          transferDate: transfer.transfer_date
+        });
+
+        console.log(`Created transfer for ${owner.name}: ₹${netAmount} (${ownerBookings.length} bookings)`);
+
+      } catch (ownerError) {
+        console.error(`Error processing owner ${owner.id}:`, ownerError);
+        continue;
+      }
+    }
+
+    console.log(`Processed ${transfers.length} fund transfers`);
+
+    res.json({ 
+      transfers,
+      message: `Successfully processed ${transfers.length} fund transfers for the week`,
+      weekStart: weekStart.toISOString(),
+      weekEnd: weekEnd.toISOString()
+    });
+
+  } catch (e) {
+    console.error('SuperAdmin process weekly transfers error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get all pending transfers (paid bookings that need to be paid to owners)
+app.get('/api/superadmin/pending-transfers', auth('superadmin'), async (req, res) => {
+  try {
+    console.log('[SuperAdmin] Getting pending transfers by user:', req.user.id);
+    
+    // Step 1: Get all bookings (let's see what we have)
+    const { data: allBookings, error: allBookingsError } = await supabaseAdmin
+      .from('bookings')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (allBookingsError) {
+      console.error('Error fetching all bookings:', allBookingsError);
+      return res.status(400).json({ message: allBookingsError.message });
+    }
+
+    console.log(`Total bookings found: ${allBookings?.length || 0}`);
+
+    // Step 2: Filter for paid online bookings only (cash payments don't need settlements)
+    const paidBookings = (allBookings || []).filter(booking => {
+      const isPaid = booking.payment_status === 'completed' || booking.payment_status === 'paid';
+      const notCancelled = booking.booking_status !== 'cancelled';
+      const isOnlinePayment = booking.payment_method === 'online'; // Only online payments
+      const isPendingSettlement = booking.owner_settlement_status === 'pending';
+      return isPaid && notCancelled && isOnlinePayment && isPendingSettlement;
+    });
+
+    console.log(`Online bookings with pending settlements found: ${paidBookings.length}`);
+
+    if (paidBookings.length === 0) {
+      return res.json({ 
+        transfers: [],
+        message: 'No pending online payment settlements found. Cash payments are handled directly at turfs.',
+        debug: {
+          totalBookings: allBookings?.length || 0,
+          filter: 'online payments with pending settlements only'
+        }
+      });
+    }
+
+    // Step 3: Get all turfs
+    const { data: allTurfs, error: turfsError } = await supabaseAdmin
+      .from('turfs')
+      .select('*');
+
+    if (turfsError) {
+      console.error('Error fetching turfs:', turfsError);
+      return res.status(400).json({ message: turfsError.message });
+    }
+
+    console.log(`Total turfs found: ${allTurfs?.length || 0}`);
+
+    // Step 4: Get all profiles
+    const { data: allProfiles, error: profilesError } = await supabaseAdmin
+      .from('profiles')
+      .select('*');
+
+    if (profilesError) {
+      console.error('Error fetching profiles:', profilesError);
+      return res.status(400).json({ message: profilesError.message });
+    }
+
+    console.log(`Total profiles found: ${allProfiles?.length || 0}`);
+
+    // Step 5: Create lookup maps
+    const turfMap = {};
+    (allTurfs || []).forEach(turf => {
+      turfMap[turf.id] = turf;
+    });
+
+    const profileMap = {};
+    (allProfiles || []).forEach(profile => {
+      profileMap[profile.id] = profile;
+    });
+
+    // Step 6: Group bookings by owner
+    const ownerTransfers = {};
+    
+    for (const booking of paidBookings) {
+      const turf = turfMap[booking.turf_id];
+      if (!turf || !turf.owner) {
+        console.log(`No turf or owner found for booking ${booking.id}, turf_id: ${booking.turf_id}`);
+        continue;
+      }
+
+      const owner = profileMap[turf.owner];
+      if (!owner) {
+        console.log(`No profile found for owner ${turf.owner}`);
+        continue;
+      }
+
+      const ownerId = turf.owner;
+      
+      if (!ownerTransfers[ownerId]) {
+        ownerTransfers[ownerId] = {
+          turfOwnerId: ownerId,
+          turfOwnerName: owner.name || 'Unknown Owner',
+          turfOwnerEmail: owner.email || 'unknown@example.com',
+          bookings: [],
+          totalEarnings: 0,
+          netAmount: 0
+        };
+      }
+      
+      ownerTransfers[ownerId].bookings.push({
+        id: booking.id,
+        userName: booking.user_name,
+        userEmail: booking.user_email,
+        turfName: booking.turf_name,
+        amount: booking.total_amount,
+        bookingDate: booking.booking_date,
+        startTime: booking.start_time,
+        endTime: booking.end_time,
+        createdAt: booking.created_at
+      });
+      
+      ownerTransfers[ownerId].totalEarnings += booking.total_amount || 0;
+    }
+
+    // Step 7: Calculate net amount for each owner (full amount)
+    const transfers = Object.values(ownerTransfers).map(transfer => {
+      transfer.netAmount = transfer.totalEarnings; // Full amount goes to owner
+      return transfer;
+    });
+
+    console.log(`Found ${transfers.length} owners with pending payments`);
+    res.json({ 
+      transfers,
+      debug: {
+        totalBookings: allBookings?.length || 0,
+        paidBookings: paidBookings.length,
+        totalTurfs: allTurfs?.length || 0,
+        totalProfiles: allProfiles?.length || 0,
+        ownersWithTransfers: transfers.length
+      }
+    });
+
+  } catch (e) {
+    console.error('SuperAdmin pending transfers error:', e);
+    res.status(500).json({ message: 'Server error: ' + e.message });
+  }
+});
+
+// Mark owner as paid (update all pending settlements for the owner)
+app.post('/api/superadmin/mark-owner-paid', auth('superadmin'), async (req, res) => {
+  try {
+    const { ownerId, amount } = req.body;
+    console.log('[SuperAdmin] Marking owner as paid:', ownerId, 'amount:', amount, 'by user:', req.user.id);
+    
+    if (!ownerId) {
+      return res.status(400).json({ message: 'Owner ID is required' });
+    }
+
+    // Get all turfs owned by this owner
+    const { data: ownerTurfs, error: turfsError } = await supabaseAdmin
+      .from('turfs')
+      .select('id')
+      .eq('owner', ownerId);
+
+    if (turfsError) {
+      console.error('Error fetching owner turfs:', turfsError);
+      return res.status(400).json({ message: turfsError.message });
+    }
+
+    const turfIds = (ownerTurfs || []).map(t => t.id);
+
+    if (turfIds.length === 0) {
+      return res.status(404).json({ message: 'No turfs found for this owner' });
+    }
+
+    // Update all pending settlements for this owner to completed (online payments only)
+    const { data: updatedBookings, error: updateError } = await supabaseAdmin
+      .from('bookings')
+      .update({
+        owner_settlement_status: 'completed',
+        settled_at: new Date().toISOString()
+      })
+      .in('turf_id', turfIds)
+      .eq('owner_settlement_status', 'pending')
+      .eq('payment_status', 'completed')
+      .eq('booking_status', 'confirmed')
+      .eq('payment_method', 'online') // Only mark online payments as settled
+      .select('id, total_amount, payout_amount, turf_name, payment_method');
+
+    if (updateError) {
+      console.error('Error updating settlement status:', updateError);
+      return res.status(400).json({ message: updateError.message });
+    }
+
+    const bookingsCount = updatedBookings?.length || 0;
+    const actualAmount = (updatedBookings || []).reduce((sum, booking) => 
+      sum + (booking.payout_amount || booking.total_amount), 0
+    );
+
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_mark_owner_paid',
+      message: `Marked owner ${ownerId} as paid ₹${actualAmount} for ${bookingsCount} online bookings`,
+      details: { 
+        ownerId, 
+        requestedAmount: amount, 
+        actualAmount,
+        bookingsCount,
+        paymentType: 'online only',
+        timestamp: new Date().toISOString() 
+      }
+    });
+
+    console.log(`Payment recorded: Owner ${ownerId} paid ₹${actualAmount} for ${bookingsCount} online bookings on ${new Date().toISOString()}`);
+
+    res.json({ 
+      message: `Owner marked as paid successfully. ${bookingsCount} online payment settlements completed.`,
+      ownerId,
+      requestedAmount: amount,
+      actualAmount,
+      bookingsCount,
+      paymentType: 'online only',
+      paidDate: new Date().toISOString()
+    });
+
+  } catch (e) {
+    console.error('SuperAdmin mark owner paid error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get pending owner settlements (individual bookings)
+app.get('/api/superadmin/pending-settlements', auth('superadmin'), async (req, res) => {
+  try {
+    console.log('[SuperAdmin] Getting pending settlements by user:', req.user.id);
+    
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_view_pending_settlements',
+      message: 'Viewed pending owner settlements',
+      details: { timestamp: new Date().toISOString() }
+    });
+
+    const { ownerId } = req.query;
+
+    let query = supabaseAdmin
+      .from('pending_owner_settlements')
+      .select('*')
+      .order('booking_created_at', { ascending: false });
+
+    // Filter by specific owner if provided
+    if (ownerId) {
+      query = query.eq('owner_id', ownerId);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      console.error('Error fetching pending settlements:', error);
+      return res.status(400).json({ message: error.message });
+    }
+
+    console.log(`Found ${data?.length || 0} pending settlements`);
+    res.json({ 
+      settlements: data || [],
+      total: data?.length || 0
+    });
+
+  } catch (e) {
+    console.error('SuperAdmin pending settlements error:', e);
+    res.status(500).json({ message: 'Server error: ' + e.message });
+  }
+});
+
+// Get owner settlement summary
+app.get('/api/superadmin/settlement-summary', auth('superadmin'), async (req, res) => {
+  try {
+    console.log('[SuperAdmin] Getting settlement summary by user:', req.user.id);
+    
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_view_settlement_summary',
+      message: 'Viewed owner settlement summary',
+      details: { timestamp: new Date().toISOString() }
+    });
+
+    const { data, error } = await supabaseAdmin
+      .from('owner_settlement_summary')
+      .select('*')
+      .order('total_pending_amount', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching settlement summary:', error);
+      return res.status(400).json({ message: error.message });
+    }
+
+    console.log(`Found ${data?.length || 0} owners with pending settlements`);
+    res.json({ 
+      summary: data || [],
+      total: data?.length || 0
+    });
+
+  } catch (e) {
+    console.error('SuperAdmin settlement summary error:', e);
+    res.status(500).json({ message: 'Server error: ' + e.message });
+  }
+});
+
+// Mark specific bookings as settled
+app.post('/api/superadmin/mark-bookings-settled', auth('superadmin'), async (req, res) => {
+  try {
+    const { bookingIds, settlementReference } = req.body;
+    
+    if (!bookingIds || !Array.isArray(bookingIds) || bookingIds.length === 0) {
+      return res.status(400).json({ message: 'Booking IDs are required' });
+    }
+
+    console.log('[SuperAdmin] Marking bookings as settled:', bookingIds, 'by user:', req.user.id);
+    
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_mark_bookings_settled',
+      message: `Marked ${bookingIds.length} bookings as settled`,
+      details: { bookingIds, settlementReference, timestamp: new Date().toISOString() }
+    });
+
+    // Update bookings settlement status
+    const { data, error } = await supabaseAdmin
+      .from('bookings')
+      .update({
+        owner_settlement_status: 'completed',
+        owner_settlement_date: new Date().toISOString(),
+        settlement_reference: settlementReference || `SETTLEMENT_${Date.now()}`
+      })
+      .in('id', bookingIds)
+      .eq('owner_settlement_status', 'pending')
+      .select('id, owner_settlement_amount, turf_name, user_name');
+
+    if (error) {
+      console.error('Error updating settlement status:', error);
+      return res.status(400).json({ message: error.message });
+    }
+
+    const totalAmount = (data || []).reduce((sum, booking) => sum + (booking.owner_settlement_amount || 0), 0);
+
+    console.log(`Successfully marked ${data?.length || 0} bookings as settled, total amount: ₹${totalAmount}`);
+
+    res.json({ 
+      message: `Successfully marked ${data?.length || 0} bookings as settled`,
+      settledBookings: data || [],
+      totalAmount,
+      settlementReference: settlementReference || `SETTLEMENT_${Date.now()}`
+    });
+
+  } catch (e) {
+    console.error('SuperAdmin mark bookings settled error:', e);
+    res.status(500).json({ message: 'Server error: ' + e.message });
+  }
+});
+
+// Mark all pending settlements for an owner as settled
+app.post('/api/superadmin/mark-owner-settlements-completed', auth('superadmin'), async (req, res) => {
+  try {
+    const { ownerId, settlementReference } = req.body;
+    
+    if (!ownerId) {
+      return res.status(400).json({ message: 'Owner ID is required' });
+    }
+
+    console.log('[SuperAdmin] Marking all settlements for owner as completed:', ownerId, 'by user:', req.user.id);
+    
+    // Get all pending bookings for this owner
+    const { data: ownerTurfs, error: turfsError } = await supabaseAdmin
+      .from('turfs')
+      .select('id')
+      .eq('owner', ownerId);
+
+    if (turfsError) {
+      console.error('Error fetching owner turfs:', turfsError);
+      return res.status(400).json({ message: turfsError.message });
+    }
+
+    const turfIds = (ownerTurfs || []).map(t => t.id);
+
+    if (turfIds.length === 0) {
+      return res.status(404).json({ message: 'No turfs found for this owner' });
+    }
+
+    // Update all pending settlements for this owner
+    const { data, error } = await supabaseAdmin
+      .from('bookings')
+      .update({
+        owner_settlement_status: 'completed',
+        owner_settlement_date: new Date().toISOString(),
+        settlement_reference: settlementReference || `OWNER_SETTLEMENT_${ownerId}_${Date.now()}`
+      })
+      .in('turf_id', turfIds)
+      .eq('owner_settlement_status', 'pending')
+      .eq('payment_status', 'completed')
+      .eq('booking_status', 'confirmed')
+      .select('id, owner_settlement_amount, turf_name, user_name');
+
+    if (error) {
+      console.error('Error updating owner settlements:', error);
+      return res.status(400).json({ message: error.message });
+    }
+
+    const totalAmount = (data || []).reduce((sum, booking) => sum + (booking.owner_settlement_amount || 0), 0);
+
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_mark_owner_settlements_completed',
+      message: `Marked all settlements for owner ${ownerId} as completed (₹${totalAmount})`,
+      details: { ownerId, totalAmount, bookingsCount: data?.length || 0, settlementReference, timestamp: new Date().toISOString() }
+    });
+
+    console.log(`Successfully marked ${data?.length || 0} settlements as completed for owner ${ownerId}, total amount: ₹${totalAmount}`);
+
+    res.json({ 
+      message: `Successfully completed settlements for owner`,
+      settledBookings: data || [],
+      totalAmount,
+      bookingsCount: data?.length || 0,
+      settlementReference: settlementReference || `OWNER_SETTLEMENT_${ownerId}_${Date.now()}`
+    });
+
+  } catch (e) {
+    console.error('SuperAdmin mark owner settlements completed error:', e);
+    res.status(500).json({ message: 'Server error: ' + e.message });
   }
 });
 
