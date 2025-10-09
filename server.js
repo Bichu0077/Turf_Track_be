@@ -8,8 +8,6 @@ import nodemailer from "nodemailer";
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
 
-// ...existing code...
-
 dotenv.config();
 
 const app = express();
@@ -88,14 +86,35 @@ async function getUserFromAuthHeader(req) {
     return { error: 'Invalid token' };
   }
   const user = data.user;
-  const role = (user?.user_metadata?.role === 'admin') ? 'admin' : 'user';
+  
+  // Get role from profiles table for more accurate role checking
+  let userRole = 'user'; // default
+  try {
+    const { data: profile } = await supabaseAdmin
+      .from('profiles')
+      .select('role')
+      .eq('id', user.id)
+      .single();
+    
+    if (profile && profile.role) {
+      userRole = profile.role;
+    } else {
+      // Fallback to user metadata
+      userRole = (user?.user_metadata?.role === 'admin') ? 'admin' : 'user';
+    }
+  } catch (e) {
+    console.error('[getUserFromAuthHeader] Error fetching profile role:', e);
+    // Fallback to user metadata
+    userRole = (user?.user_metadata?.role === 'admin') ? 'admin' : 'user';
+  }
+  
   return {
     user: {
       sub: user.id,
       id: user.id,
       email: user.email,
       name: user.user_metadata?.name || '',
-      role,
+      role: userRole,
     },
     token,
   };
@@ -181,9 +200,48 @@ function auth(requiredRole) {
     const result = await getUserFromAuthHeader(req);
     if (result.error) return res.status(401).json({ message: result.error });
     req.user = result.user;
-    if (requiredRole && req.user.role !== requiredRole) {
-      return res.status(403).json({ message: 'Forbidden' });
+    
+    // Special handling for superadmin role
+    if (requiredRole === 'superadmin') {
+      if (req.user.role !== 'superadmin') {
+        return res.status(403).json({ message: 'Forbidden - Super Admin access required' });
+      }
+      
+      // Security check: Ensure only one superadmin exists
+      try {
+        const { data: superAdmins, error } = await supabaseAdmin
+          .from('profiles')
+          .select('id')
+          .eq('role', 'superadmin');
+        
+        if (error) {
+          console.error('Error checking superadmin count:', error);
+          return res.status(500).json({ message: 'Authentication error' });
+        }
+        
+        if (superAdmins.length > 1) {
+          console.error('Multiple superadmin accounts detected! IDs:', superAdmins.map(s => s.id));
+          return res.status(403).json({ 
+            message: 'Security violation: Multiple super admin accounts detected. Please contact system administrator.' 
+          });
+        }
+        
+        if (superAdmins.length === 0 || superAdmins[0].id !== req.user.id) {
+          return res.status(403).json({ message: 'Forbidden - Invalid super admin account' });
+        }
+      } catch (e) {
+        console.error('Error in superadmin security check:', e);
+        return res.status(500).json({ message: 'Authentication error' });
+      }
+    } else if (requiredRole && req.user.role !== requiredRole) {
+      // Allow superadmin to access admin endpoints
+      if (requiredRole === 'admin' && req.user.role === 'superadmin') {
+        // Superadmin can access admin endpoints
+      } else {
+        return res.status(403).json({ message: 'Forbidden' });
+      }
     }
+    
     next();
   };
 }
@@ -420,14 +478,64 @@ app.post('/api/auth/login', async (req, res) => {
     const accessToken = data.session.access_token;
     const { data: userData } = await supabaseAnon.auth.getUser(accessToken);
     const meta = userData?.user?.user_metadata || {};
-    const role = (meta.role === 'admin') ? 'admin' : 'user';
+    
+    // Get role from profiles table for more accurate role checking
+    let userRole = 'user'; // default
+    try {
+      const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('role')
+        .eq('id', userData?.user?.id)
+        .single();
+      
+      if (profile && profile.role) {
+        userRole = profile.role;
+      } else {
+        // Fallback to user metadata
+        userRole = (meta.role === 'admin') ? 'admin' : 'user';
+      }
+    } catch (e) {
+      console.error('Error fetching profile role during login:', e);
+      // Fallback to user metadata
+      userRole = (meta.role === 'admin') ? 'admin' : 'user';
+    }
+    
+    // Security check for superadmin - ensure only one exists
+    if (userRole === 'superadmin') {
+      try {
+        const { data: superAdmins, error: saError } = await supabaseAdmin
+          .from('profiles')
+          .select('id')
+          .eq('role', 'superadmin');
+        
+        if (saError) {
+          console.error('Error checking superadmin count during login:', saError);
+          return res.status(500).json({ message: 'Authentication error' });
+        }
+        
+        if (superAdmins.length > 1) {
+          console.error('Multiple superadmin accounts detected during login! IDs:', superAdmins.map(s => s.id));
+          return res.status(403).json({ 
+            message: 'Security violation: Multiple super admin accounts detected. Please contact system administrator.' 
+          });
+        }
+        
+        if (superAdmins.length === 0 || superAdmins[0].id !== userData?.user?.id) {
+          return res.status(403).json({ message: 'Invalid super admin account' });
+        }
+      } catch (e) {
+        console.error('Error in superadmin security check during login:', e);
+        return res.status(500).json({ message: 'Authentication error' });
+      }
+    }
+    
     const userResponse = { 
       token: accessToken, 
       user: { 
         id: userData?.user?.id, 
         name: meta.name || '', 
         email: userData?.user?.email, 
-        role,
+        role: userRole,
         createdAt: formatDate(userData?.user?.created_at),
         memberSince: formatDate(userData?.user?.created_at),
         lastLoginAt: new Date().toISOString()
@@ -1090,6 +1198,7 @@ app.get('/api/user/overview', auth('user'), (req, res) => {
 
 function mapTurfRowToApi(row) {
   let finalLocation;
+  let locationAddress;
 
   // Case 1: The new coordinate object exists and is valid. Use it.
   if (row.location_coordinates && typeof row.location_coordinates === 'object' && row.location_coordinates.address) {
@@ -1098,6 +1207,7 @@ function mapTurfRowToApi(row) {
       latitude: row.location_coordinates.latitude,
       longitude: row.location_coordinates.longitude,
     };
+    locationAddress = row.location_coordinates.address;
   } 
   // Case 2: Fallback to the old location string if coordinate object is missing.
   else if (typeof row.location === 'string') {
@@ -1106,6 +1216,7 @@ function mapTurfRowToApi(row) {
       latitude: null, // Mark coordinates as unavailable
       longitude: null,
     };
+    locationAddress = row.location;
   } 
   // Case 3: Default to an empty object if no location data is found at all.
   else {
@@ -1114,12 +1225,15 @@ function mapTurfRowToApi(row) {
       latitude: null,
       longitude: null,
     };
+    locationAddress = 'Location not available';
   }
 
   const result = {
     _id: row.id,
+    id: row.id, // Add id field for frontend compatibility
     name: row.name,
-    location: finalLocation, // This is now ALWAYS an object
+    location: locationAddress, // Send as string for frontend compatibility
+    locationCoordinates: finalLocation, // Keep object version for coordinate features
     description: row.description || '',
     images: Array.isArray(row.images) ? row.images : [],
     pricePerHour: row.price_per_hour,
@@ -1254,7 +1368,7 @@ app.get('/api/turfs/public', async (req, res) => {
 
       turfs = turfs.filter(turf => {
         // Check if turf has coordinate data
-        const turfLocation = turf.location;
+        const turfLocation = turf.locationCoordinates;
         if (typeof turfLocation === 'object' && 
             turfLocation.latitude && 
             turfLocation.longitude) {
@@ -2295,6 +2409,548 @@ async function cleanupExpiredTentativeBookings() {
 
 // Run cleanup every 5 minutes
 setInterval(cleanupExpiredTentativeBookings, 5 * 60 * 1000);
+
+// Super Admin endpoints
+// ==================
+
+// Super Admin Dashboard Overview
+app.get('/api/superadmin/overview', auth('superadmin'), async (req, res) => {
+  try {
+    console.log('[SuperAdmin] Overview requested by user:', req.user.id);
+    
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_dashboard_access',
+      message: 'Accessed Super Admin dashboard overview',
+      details: { timestamp: new Date().toISOString() }
+    });
+
+    // Get all stats
+    const [bookingsResult, paymentsResult, turfsResult, usersResult] = await Promise.all([
+      // Total bookings and today's bookings
+      supabaseAdmin.from('bookings').select('id, total_amount, booking_status, created_at'),
+      // All payments (completed bookings for now)
+      supabaseAdmin.from('bookings').select('id, total_amount, payment_status, payment_method, created_at').eq('payment_status', 'completed'),
+      // All turfs
+      supabaseAdmin.from('turfs').select('id, name, created_at'),
+      // All users
+      supabaseAdmin.from('profiles').select('id, role, created_at')
+    ]);
+
+    if (bookingsResult.error || paymentsResult.error || turfsResult.error || usersResult.error) {
+      console.error('SuperAdmin overview query errors:', {
+        bookings: bookingsResult.error,
+        payments: paymentsResult.error,
+        turfs: turfsResult.error,
+        users: usersResult.error
+      });
+      return res.status(500).json({ message: 'Error fetching dashboard data' });
+    }
+
+    const bookings = bookingsResult.data || [];
+    const payments = paymentsResult.data || [];
+    const turfs = turfsResult.data || [];
+    const users = usersResult.data || [];
+
+    // Calculate stats
+    const today = new Date().toISOString().split('T')[0];
+    const totalBookings = bookings.length;
+    const todayBookings = bookings.filter(b => b.created_at?.startsWith(today)).length;
+    const totalRevenue = payments.reduce((sum, p) => sum + (Number(p.total_amount) || 0), 0);
+    const todayRevenue = payments.filter(p => p.created_at?.startsWith(today)).reduce((sum, p) => sum + (Number(p.total_amount) || 0), 0);
+    const activeTurfs = turfs.length;
+    const totalUsers = users.filter(u => u.role !== 'superadmin').length;
+    const turfOwners = users.filter(u => u.role === 'admin').length;
+    const regularUsers = users.filter(u => u.role === 'user').length;
+
+    const overview = {
+      stats: {
+        totalBookings,
+        todayBookings,
+        totalRevenue: totalRevenue.toFixed(2),
+        todayRevenue: todayRevenue.toFixed(2),
+        activeTurfs,
+        totalUsers,
+        turfOwners,
+        regularUsers
+      },
+      recentActivity: [
+        `${todayBookings} bookings created today`,
+        `₹${todayRevenue.toFixed(2)} revenue generated today`,
+        `${activeTurfs} active turfs on platform`,
+        `${totalUsers} total users registered`
+      ]
+    };
+
+    res.json(overview);
+  } catch (e) {
+    console.error('SuperAdmin overview error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Super Admin - Get All Bookings
+app.get('/api/superadmin/bookings', auth('superadmin'), async (req, res) => {
+  try {
+    console.log('[SuperAdmin] All bookings requested by user:', req.user.id);
+    
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_view_bookings',
+      message: 'Viewed all platform bookings',
+      details: { timestamp: new Date().toISOString() }
+    });
+
+    const { page = 1, limit = 50, search = '', status = '', date = '' } = req.query;
+    
+    let query = supabaseAdmin
+      .from('bookings')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    // Apply filters
+    if (search) {
+      query = query.or(`user_name.ilike.%${search}%,user_email.ilike.%${search}%,turf_name.ilike.%${search}%`);
+    }
+    
+    if (status) {
+      query = query.eq('booking_status', status);
+    }
+    
+    if (date) {
+      query = query.eq('booking_date', date);
+    }
+
+    // Apply pagination
+    const offset = (Number(page) - 1) * Number(limit);
+    query = query.range(offset, offset + Number(limit) - 1);
+
+    const { data, error, count } = await query;
+    if (error) return res.status(400).json({ message: error.message });
+
+    // Get turf names for mapping
+    const turfIds = Array.from(new Set((data || []).map(b => b.turf_id)));
+    let turfNameMap = {};
+    if (turfIds.length) {
+      const { data: turfs } = await supabaseAdmin
+        .from('turfs')
+        .select('id, name')
+        .in('id', turfIds);
+      if (turfs) turfNameMap = Object.fromEntries(turfs.map(t => [t.id, t.name]));
+    }
+
+    res.json({ 
+      bookings: (data || []).map(r => mapBookingRowToApi(r, turfNameMap)),
+      pagination: {
+        page: Number(page),
+        limit: Number(limit),
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / Number(limit))
+      }
+    });
+  } catch (e) {
+    console.error('SuperAdmin bookings error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Super Admin - Get All Payments
+app.get('/api/superadmin/payments', auth('superadmin'), async (req, res) => {
+  try {
+    console.log('[SuperAdmin] All payments requested by user:', req.user.id);
+    
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_view_payments',
+      message: 'Viewed all platform payments',
+      details: { timestamp: new Date().toISOString() }
+    });
+
+    const { page = 1, limit = 50, search = '', method = '', status = '' } = req.query;
+    
+    let query = supabaseAdmin
+      .from('bookings')
+      .select('*')
+      .not('payment_status', 'eq', 'pending')
+      .order('created_at', { ascending: false });
+
+    // Apply filters
+    if (search) {
+      query = query.or(`user_name.ilike.%${search}%,user_email.ilike.%${search}%,turf_name.ilike.%${search}%`);
+    }
+    
+    if (method) {
+      query = query.eq('payment_method', method);
+    }
+    
+    if (status) {
+      query = query.eq('payment_status', status);
+    }
+
+    // Apply pagination
+    const offset = (Number(page) - 1) * Number(limit);
+    query = query.range(offset, offset + Number(limit) - 1);
+
+    const { data, error, count } = await query;
+    if (error) return res.status(400).json({ message: error.message });
+
+    const payments = (data || []).map(booking => ({
+      id: booking.id,
+      bookingId: booking.id,
+      userId: booking.user_id,
+      userName: booking.user_name,
+      userEmail: booking.user_email,
+      turfName: booking.turf_name,
+      amount: Number(booking.total_amount || 0),
+      paymentMethod: booking.payment_method,
+      paymentStatus: booking.payment_status,
+      razorpayOrderId: booking.razorpay_order_id,
+      razorpayPaymentId: booking.razorpay_payment_id,
+      bookingDate: booking.booking_date,
+      createdAt: booking.created_at,
+    }));
+
+    res.json({ 
+      payments,
+      pagination: {
+        page: Number(page),
+        limit: Number(limit),
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / Number(limit))
+      }
+    });
+  } catch (e) {
+    console.error('SuperAdmin payments error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Super Admin - Get All Turfs
+app.get('/api/superadmin/turfs', auth('superadmin'), async (req, res) => {
+  try {
+    console.log('[SuperAdmin] All turfs requested by user:', req.user.id);
+    
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_view_turfs',
+      message: 'Viewed all platform turfs',
+      details: { timestamp: new Date().toISOString() }
+    });
+
+    const { page = 1, limit = 50, search = '' } = req.query;
+    
+    let query = supabaseAdmin
+      .from('turfs')
+      .select(`
+        *,
+        owner_profile:profiles!turfs_owner_fkey(name, email)
+      `)
+      .order('created_at', { ascending: false });
+
+    // Apply search filter
+    if (search) {
+      query = query.or(`name.ilike.%${search}%,location.ilike.%${search}%`);
+    }
+
+    // Apply pagination
+    const offset = (Number(page) - 1) * Number(limit);
+    query = query.range(offset, offset + Number(limit) - 1);
+
+    const { data, error, count } = await query;
+    if (error) return res.status(400).json({ message: error.message });
+
+    const turfs = (data || []).map(turf => ({
+      ...mapTurfRowToApi(turf),
+      ownerName: turf.owner_profile?.name || 'Unknown',
+      ownerEmail: turf.owner_profile?.email || 'Unknown',
+      ownerId: turf.owner,
+    }));
+
+    res.json({ 
+      turfs,
+      pagination: {
+        page: Number(page),
+        limit: Number(limit),
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / Number(limit))
+      }
+    });
+  } catch (e) {
+    console.error('SuperAdmin turfs error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Super Admin - Get All Users
+app.get('/api/superadmin/users', auth('superadmin'), async (req, res) => {
+  try {
+    console.log('[SuperAdmin] All users requested by user:', req.user.id);
+    
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_view_users',
+      message: 'Viewed all platform users',
+      details: { timestamp: new Date().toISOString() }
+    });
+
+    const { page = 1, limit = 50, search = '', role = '' } = req.query;
+    
+    let query = supabaseAdmin
+      .from('profiles')
+      .select('*')
+      .neq('role', 'superadmin') // Exclude superadmin from the list
+      .order('created_at', { ascending: false });
+
+    // Apply filters
+    if (search) {
+      query = query.or(`name.ilike.%${search}%,phone.ilike.%${search}%`);
+    }
+    
+    if (role && role !== 'all') {
+      query = query.eq('role', role);
+    }
+
+    // Apply pagination
+    const offset = (Number(page) - 1) * Number(limit);
+    query = query.range(offset, offset + Number(limit) - 1);
+
+    const { data: profiles, error: profileError, count } = await query;
+    if (profileError) return res.status(400).json({ message: profileError.message });
+
+    // Get email addresses from auth.users for each profile
+    const userIds = (profiles || []).map(p => p.id);
+    const users = [];
+    
+    for (const profile of profiles || []) {
+      try {
+        const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(profile.id);
+        users.push({
+          id: profile.id,
+          name: profile.name || '',
+          email: authUser?.user?.email || '',
+          phone: profile.phone || '',
+          role: profile.role,
+          location: profile.location || '',
+          company: profile.company || '',
+          createdAt: formatDate(authUser?.user?.created_at),
+          lastSignIn: formatDate(authUser?.user?.last_sign_in_at),
+          avatar: profile.profile_pic,
+        });
+      } catch (e) {
+        console.error('Error fetching auth data for user:', profile.id, e);
+        // Include profile even if auth data fetch fails
+        users.push({
+          id: profile.id,
+          name: profile.name || '',
+          email: 'N/A',
+          phone: profile.phone || '',
+          role: profile.role,
+          location: profile.location || '',
+          company: profile.company || '',
+          createdAt: formatDate(profile.created_at),
+          lastSignIn: 'N/A',
+          avatar: profile.profile_pic,
+        });
+      }
+    }
+
+    res.json({ 
+      users,
+      pagination: {
+        page: Number(page),
+        limit: Number(limit),
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / Number(limit))
+      }
+    });
+  } catch (e) {
+    console.error('SuperAdmin users error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Super Admin - Export Data
+app.get('/api/superadmin/export/:type', auth('superadmin'), async (req, res) => {
+  try {
+    const { type } = req.params;
+    console.log('[SuperAdmin] Export requested:', type, 'by user:', req.user.id);
+    
+    // Log activity
+    appendUserActivity(req.user.id, {
+      type: 'superadmin_export_data',
+      message: `Exported ${type} data`,
+      details: { type, timestamp: new Date().toISOString() }
+    });
+
+    let data = [];
+    let filename = '';
+
+    switch (type) {
+      case 'bookings':
+        const { data: bookings, error: bookingError } = await supabaseAdmin
+          .from('bookings')
+          .select('*')
+          .order('created_at', { ascending: false });
+        
+        if (bookingError) throw bookingError;
+        
+        data = (bookings || []).map(b => ({
+          'Booking ID': b.id,
+          'Turf Name': b.turf_name,
+          'User Name': b.user_name,
+          'User Email': b.user_email,
+          'User Phone': b.user_phone,
+          'Booking Date': b.booking_date,
+          'Start Time': b.start_time,
+          'End Time': b.end_time,
+          'Total Amount': b.total_amount,
+          'Payment Status': b.payment_status,
+          'Payment Method': b.payment_method,
+          'Booking Status': b.booking_status,
+          'Created At': b.created_at,
+        }));
+        filename = `bookings_${new Date().toISOString().split('T')[0]}.csv`;
+        break;
+
+      case 'payments':
+        const { data: payments, error: paymentError } = await supabaseAdmin
+          .from('bookings')
+          .select('*')
+          .not('payment_status', 'eq', 'pending')
+          .order('created_at', { ascending: false });
+        
+        if (paymentError) throw paymentError;
+        
+        data = (payments || []).map(p => ({
+          'Payment ID': p.id,
+          'Booking ID': p.id,
+          'User Name': p.user_name,
+          'User Email': p.user_email,
+          'Turf Name': p.turf_name,
+          'Amount': p.total_amount,
+          'Payment Method': p.payment_method,
+          'Payment Status': p.payment_status,
+          'Razorpay Order ID': p.razorpay_order_id || '',
+          'Razorpay Payment ID': p.razorpay_payment_id || '',
+          'Created At': p.created_at,
+        }));
+        filename = `payments_${new Date().toISOString().split('T')[0]}.csv`;
+        break;
+
+      case 'turfs':
+        const { data: turfs, error: turfError } = await supabaseAdmin
+          .from('turfs')
+          .select(`
+            *,
+            owner_profile:profiles!turfs_owner_fkey(name, email)
+          `)
+          .order('created_at', { ascending: false });
+        
+        if (turfError) throw turfError;
+        
+        data = (turfs || []).map(t => ({
+          'Turf ID': t.id,
+          'Turf Name': t.name,
+          'Location': typeof t.location === 'string' ? t.location : t.location_coordinates?.address || 'N/A',
+          'Price Per Hour': t.price_per_hour,
+          'Owner Name': t.owner_profile?.name || 'Unknown',
+          'Owner Email': t.owner_profile?.email || 'Unknown',
+          'Amenities': Array.isArray(t.amenities) ? t.amenities.join(', ') : '',
+          'Created At': t.created_at,
+        }));
+        filename = `turfs_${new Date().toISOString().split('T')[0]}.csv`;
+        break;
+
+      case 'users':
+        const { data: userProfiles, error: userError } = await supabaseAdmin
+          .from('profiles')
+          .select('*')
+          .neq('role', 'superadmin')
+          .order('created_at', { ascending: false });
+        
+        if (userError) throw userError;
+        
+        // Get email from auth for each user
+        const userData = [];
+        for (const profile of userProfiles || []) {
+          try {
+            const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(profile.id);
+            userData.push({
+              'User ID': profile.id,
+              'Name': profile.name || '',
+              'Email': authUser?.user?.email || 'N/A',
+              'Phone': profile.phone || '',
+              'Role': profile.role,
+              'Location': profile.location || '',
+              'Company': profile.company || '',
+              'Created At': authUser?.user?.created_at || profile.created_at,
+              'Last Sign In': authUser?.user?.last_sign_in_at || 'N/A',
+            });
+          } catch (e) {
+            userData.push({
+              'User ID': profile.id,
+              'Name': profile.name || '',
+              'Email': 'N/A',
+              'Phone': profile.phone || '',
+              'Role': profile.role,
+              'Location': profile.location || '',
+              'Company': profile.company || '',
+              'Created At': profile.created_at,
+              'Last Sign In': 'N/A',
+            });
+          }
+        }
+        data = userData;
+        filename = `users_${new Date().toISOString().split('T')[0]}.csv`;
+        break;
+
+      default:
+        return res.status(400).json({ message: 'Invalid export type' });
+    }
+
+    // Convert to CSV
+    if (data.length === 0) {
+      return res.status(404).json({ message: 'No data to export' });
+    }
+
+    const headers = Object.keys(data[0]);
+    const csvContent = [
+      headers.join(','),
+      ...data.map(row => headers.map(header => {
+        const value = row[header];
+        // Escape commas and quotes in CSV
+        if (typeof value === 'string' && (value.includes(',') || value.includes('"'))) {
+          return `"${value.replace(/"/g, '""')}"`;
+        }
+        return value;
+      }).join(','))
+    ].join('\n');
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csvContent);
+  } catch (e) {
+    console.error('SuperAdmin export error:', e);
+    res.status(500).json({ message: 'Export failed' });
+  }
+});
+
+// Super Admin - Activity Logs
+app.get('/api/superadmin/activity-logs', auth('superadmin'), async (req, res) => {
+  try {
+    console.log('[SuperAdmin] Activity logs requested by user:', req.user.id);
+    
+    // Get super admin activity logs
+    const userId = req.user.id;
+    const { limit = 100 } = req.query;
+    const activities = (userActivities.get(userId) || []).slice(0, Number(limit));
+    
+    res.json({ activities });
+  } catch (e) {
+    console.error('SuperAdmin activity logs error:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
 
 // Database migration endpoint - Update booking_status constraint
 app.post('/api/migrate/update-booking-status-constraint', auth(), async (req, res) => {
